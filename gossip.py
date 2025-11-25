@@ -154,7 +154,6 @@ class GossipService:
             )
 
     async def _pushpull(self, peer: Member) -> None:
-        """Send only membership view; receive only membership view."""
         payload = {
             "from_id": self.state.self_id,
             "from_addr": self.state.self_addr,
