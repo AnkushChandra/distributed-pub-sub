@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+import httpx
+
+import storage
+
+PlacementSnapshot = Dict[str, Dict[str, Any]]
+
+_BROKER_ID: int = 0
+_BROKER_API: Dict[int, str] = {}
+_get_snapshot: Optional[Callable[[], PlacementSnapshot]] = None
+_refresh_fn: Optional[Callable[[], Awaitable[None]]] = None
+
+
+def setup(
+    *,
+    broker_id: int,
+    broker_api: Dict[int, str],
+    placement_getter: Callable[[], PlacementSnapshot],
+    refresh_fn: Callable[[], Awaitable[None]],
+) -> None:
+    global _BROKER_ID, _BROKER_API, _get_snapshot, _refresh_fn
+    _BROKER_ID = broker_id
+    _BROKER_API = dict(broker_api)
+    _get_snapshot = placement_getter
+    _refresh_fn = refresh_fn
+
+
+def _placements() -> PlacementSnapshot:
+    if _get_snapshot is None:
+        return {}
+    return _get_snapshot()
+
+
+async def _refresh_metadata() -> None:
+    if _refresh_fn is None:
+        return
+    await _refresh_fn()
+
+
+async def follower_replication_loop(poll_interval: float = 0.5, batch_size: int = 100) -> None:
+    if _get_snapshot is None or _refresh_fn is None:
+        raise RuntimeError("replication.setup() must be called before starting the loop")
+    print(f"[Broker {_BROKER_ID}] follower replication loop running")
+    while True:
+        try:
+            await _refresh_metadata()
+            snapshot = _placements()
+            for topic, placement in snapshot.items():
+                followers = placement.get("followers") or []
+                try:
+                    follower_ids = [int(f) for f in followers]
+                except Exception:
+                    continue
+                if _BROKER_ID not in follower_ids:
+                    continue
+                owner = placement.get("owner")
+                try:
+                    owner_id = int(owner)
+                except (TypeError, ValueError):
+                    continue
+                if owner_id == _BROKER_ID:
+                    continue
+                base = _BROKER_API.get(owner_id)
+                if not base:
+                    continue
+                local_last = storage.latest_offset(topic)
+                fetch_offset = max(0, local_last + 1)
+                try:
+                    async with httpx.AsyncClient(timeout=3.0) as client:
+                        resp = await client.get(
+                            f"{base}/internal/topics/{topic}/fetch",
+                            params={"offset": fetch_offset, "max_batch": batch_size},
+                        )
+                        if resp.status_code == 404:
+                            continue
+                        if resp.status_code == 409:
+                            await _refresh_metadata()
+                            continue
+                        resp.raise_for_status()
+                        data = resp.json()
+                except Exception as e:
+                    print(f"[Broker {_BROKER_ID}] replication fetch failed: {e}")
+                    continue
+                for rec in data.get("records", []):
+                    try:
+                        off = int(rec["offset"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    storage.replicate_record(
+                        topic,
+                        off,
+                        rec.get("key"),
+                        rec.get("value"),
+                        rec.get("headers") or {},
+                    )
+        except Exception as e:
+            print(f"[Broker {_BROKER_ID}] replication loop error: {e}")
+        await asyncio.sleep(poll_interval)
