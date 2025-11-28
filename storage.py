@@ -121,3 +121,55 @@ def set_commit(topic: str, consumer_id: Optional[str], group_id: Optional[str], 
             "INSERT INTO commits(k, offset) VALUES(?, ?) "
             "ON CONFLICT(k) DO UPDATE SET offset=excluded.offset", (k, int(offset))
         )
+
+# ---- replication helpers ----
+
+def latest_offset(topic: str) -> int:
+    """
+    Return the last offset for a topic, or -1 if the topic has no records.
+    Uses topic_next_offset() which tracks the next offset to be assigned.
+    """
+    with _lock:
+        row = _conn.execute(
+            "SELECT next_offset FROM topic_seq WHERE topic=?", (topic,)
+        ).fetchone()
+        if not row:
+            return -1
+        next_off = int(row[0])
+        return next_off - 1 if next_off > 0 else -1
+
+
+def replicate_record(topic: str, offset: int, key: Optional[str], value: Any, headers: Dict[str, Any]) -> None:
+    """
+    Insert a record with an explicit offset (used by followers replicating from the leader).
+    Ensures topic_seq.next_offset is at least offset+1.
+    If a record with that (topic, offset) already exists, this is a no-op.
+    """
+    payload = json.dumps(value, separators=(",", ":"))
+    hjson   = json.dumps(headers or {}, separators=(",", ":"))
+    ts = _now_ms()
+    with _lock:
+        _conn.execute("BEGIN IMMEDIATE;")
+        # ensure topic sequence row exists
+        _conn.execute(
+            "INSERT INTO topic_seq(topic, next_offset) VALUES(?, 0) "
+            "ON CONFLICT(topic) DO NOTHING", (topic,)
+        )
+        # insert record with explicit offset; ignore if already present
+        _conn.execute(
+            "INSERT OR IGNORE INTO records(topic, offset, ts_ms, key, value_json, headers_json) "
+            "VALUES(?,?,?,?,?,?)",
+            (topic, int(offset), ts, key, payload, hjson)
+        )
+        # bump next_offset if needed
+        row = _conn.execute(
+            "SELECT next_offset FROM topic_seq WHERE topic=?", (topic,)
+        ).fetchone()
+        next_off = int(row[0]) if row else 0
+        desired_next = int(offset) + 1
+        if desired_next > next_off:
+            _conn.execute(
+                "UPDATE topic_seq SET next_offset=? WHERE topic=?",
+                (desired_next, topic)
+            )
+        _conn.execute("COMMIT;")

@@ -1,125 +1,133 @@
-# main.py
-from typing import Optional, Dict, Any, List, Tuple
-from fastapi import FastAPI, HTTPException, Query
+from __future__ import annotations
+
+import asyncio
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-import asyncio, time
 
-import storage as st
+import storage
+from bully import BullyService
+from replication import (
+    setup_replication,
+    is_leader,
+    get_owner_for,
+    get_all_metadata_for_api,
+    refresh_owner_cache_if_needed,
+    assign_topic,
+    follower_replication_loop,
+)
 
-app = FastAPI(title="Mini Pub/Sub (SQLite)")
+BROKER_ID = int(os.getenv("BROKER_ID", "1"))
+BROKER_API = {
+    1: "http://localhost:8001",
+    2: "http://localhost:8002",
+    3: "http://localhost:8003",
+}
 
-# --------- models ----------
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+# Start bully algorithm
+election = BullyService(BROKER_ID)
+election.start()
+
+def get_leader_id() -> Optional[int]:
+    return election.current_leader
+
+
+# ---- Lifespan to start follower replication loop ----
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    asyncio.create_task(follower_replication_loop())
+    yield
+    # Shutdown (nothing needed here)
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# ---- Replication setup ----
+setup_replication(
+    broker_id=BROKER_ID,
+    broker_api=BROKER_API,
+    data_dir=DATA_DIR,
+    leader_getter=get_leader_id,
+)
+
+
+# ---------------- Models ----------------
 class PublishRequest(BaseModel):
-    key: Optional[str] = None
+    key: str
     value: Any
     headers: Dict[str, Any] = Field(default_factory=dict)
 
-class SubscribeRequest(BaseModel):
-    topic: str
-    consumer_id: Optional[str] = None
-    group_id: Optional[str] = None
-    from_offset: Optional[int] = None
 
-class CommitRequest(BaseModel):
-    topic: str
-    offset: int
-    consumer_id: Optional[str] = None
-    group_id: Optional[str] = None
+# ---------------- Helpers ----------------
+def _owner_base(owner_id: int) -> str:
+    if owner_id not in BROKER_API:
+        raise HTTPException(500, f"Unknown broker {owner_id}")
+    return BROKER_API[owner_id]
 
-# --------- in-proc coordination (for long-poll) ----------
-class TopicNotifier:
-    def __init__(self, topic: str):
-        self.topic = topic
-        self.cond = asyncio.Condition()
 
-    async def notify(self):
-        async with self.cond:
-            self.cond.notify_all()
+async def _proxy_post(base: str, path: str, payload: Dict[str, Any]):
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        r = await client.post(f"{base}{path}", json=payload)
+        r.raise_for_status()
+        return r.json()
 
-    async def wait(self, timeout: float) -> bool:
-        async with self.cond:
-            try:
-                await asyncio.wait_for(self.cond.wait(), timeout=timeout)
-                return True
-            except asyncio.TimeoutError:
-                return False
 
-_notifiers: Dict[str, TopicNotifier] = {}
-_group_leases: Dict[Tuple[str, str], float] = {}
-LEASE_TTL_SEC = 10.0
-
-def _notifier(topic: str) -> TopicNotifier:
-    if topic not in _notifiers:
-        st.init_topic(topic)  # ensures topic_seq row
-        _notifiers[topic] = TopicNotifier(topic)
-    return _notifiers[topic]
-
-def _enforce_group_singleton(topic: str, group_id: Optional[str]):
-    if not group_id:
-        return
-    now = time.time()
-    k = (topic, group_id)
-    if _group_leases.get(k, 0.0) > now:
-        raise HTTPException(status_code=409, detail="Group already has an active consumer")
-    _group_leases[k] = now + LEASE_TTL_SEC
-
-def _committed(topic: str, consumer_id: Optional[str], group_id: Optional[str]) -> int:
-    return st.get_commit(topic, consumer_id, group_id)
-
-def _commit(topic: str, consumer_id: Optional[str], group_id: Optional[str], offset: int) -> None:
-    st.set_commit(topic, consumer_id, group_id, offset)
-    if group_id:
-        _group_leases[(topic, group_id)] = time.time() + LEASE_TTL_SEC
-
-# --------- endpoints ----------
+# ---------------- Publish ----------------
 @app.post("/topics/{topic}/publish")
 async def publish(topic: str, req: PublishRequest):
-    off = st.append_record(topic, req.key, req.value, req.headers)
-    await _notifier(topic).notify()
-    return {"topic": topic, "offset": off}
+    await refresh_owner_cache_if_needed()
+    owner = get_owner_for(topic)
+    if owner is None:
+        raise HTTPException(404, "Topic not found")
 
-@app.post("/subscribe")
-async def subscribe(sub: SubscribeRequest):
-    _enforce_group_singleton(sub.topic, sub.group_id)
-    committed = _committed(sub.topic, sub.consumer_id, sub.group_id)
-    start = sub.from_offset if sub.from_offset is not None else (committed + 1)
-    return {"topic": sub.topic, "start_offset": max(start, 0), "committed": committed}
+    if owner != BROKER_ID:
+        return await _proxy_post(_owner_base(owner), f"/topics/{topic}/publish", req.model_dump())
 
-@app.get("/poll")
-async def poll(
-    topic: str = Query(...),
-    consumer_id: Optional[str] = Query(None),
-    group_id: Optional[str] = Query(None),
-    from_offset: Optional[int] = Query(None),
-    max_records: int = Query(100, ge=1, le=1000),
-    timeout_ms: int = Query(15000, ge=0, le=60000),
-):
-    committed = _committed(topic, consumer_id, group_id)
-    start = from_offset if from_offset is not None else (committed + 1)
-    start = max(start, 0)
+    storage.init_topic(topic)
+    offset = storage.append_record(topic, req.key, req.value, req.headers)
+    return {"topic": topic, "offset": offset}
 
-    # fast path: try immediate read
-    recs = st.poll_records(topic, start, max_records)
-    if recs:
-        return {"topic": topic, "records": recs, "next_offset": start + len(recs), "committed": committed}
 
-    # long-poll until timeout or a publish arrives
-    if timeout_ms > 0:
-        waited = await _notifier(topic).wait(timeout_ms / 1000.0)
-        if waited:
-            recs = st.poll_records(topic, start, max_records)
+# ---------------- Internal Fetch for Followers ----------------
+@app.get("/internal/topics/{topic}/fetch")
+async def internal_fetch(topic: str, offset: int = 0, max_batch: int = 100):
+    owner = get_owner_for(topic)
+    if owner != BROKER_ID:
+        raise HTTPException(409, "NOT_OWNER")
 
-    return {"topic": topic, "records": recs or [], "next_offset": start + len(recs or []), "committed": committed}
+    storage.init_topic(topic)
+    return {"records": storage.poll_records(topic, offset, max_batch)}
 
-@app.post("/commit")
-async def commit(c: CommitRequest):
-    if c.offset < -1:
-        raise HTTPException(status_code=400, detail="invalid offset")
-    _commit(c.topic, c.consumer_id, c.group_id, c.offset)
-    return {"topic": c.topic, "committed": c.offset}
 
-@app.get("/metrics")
-def metrics():
+# ---------------- Client Poll ----------------
+@app.get("/topics/{topic}/poll")
+async def poll(topic: str, offset: int = 0, max_batch: int = 100):
+    storage.init_topic(topic)
+    return {"records": storage.poll_records(topic, offset, max_batch)}
+
+
+# ---------------- Metadata ----------------
+@app.get("/metadata")
+def metadata():
     return {
-        "leases": {f"{k[0]}|{k[1]}": exp for k, exp in _group_leases.items()},
+        "leader_id": get_leader_id(),
+        "topics": get_all_metadata_for_api(),
     }
+
+
+@app.post("/admin/topics")
+def admin_create_topic(name: str, owner_id: Optional[int] = None, rf: int = 3):
+    if not is_leader():
+        raise HTTPException(409, {"error": "NOT_LEADER", "leader": get_leader_id()})
+    placement = assign_topic(name, owner_id, rf)
+    return placement.model_dump()
