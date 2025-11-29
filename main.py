@@ -709,17 +709,21 @@ async def poll(
     if owner != BROKER_ID:
         base = _owner_base(owner)
         print(f"[P{BROKER_ID}] routing poll for topic={topic} to P{owner} (messages coming from {owner})")
+        params = {
+            "topic": topic,
+            "max_records": max_records,
+            "timeout_ms": timeout_ms,
+        }
+        if consumer_id is not None:
+            params["consumer_id"] = consumer_id
+        if group_id is not None:
+            params["group_id"] = group_id
+        if from_offset is not None:
+            params["from_offset"] = from_offset
         return await _proxy_get(
             base,
             "/poll",
-            {
-                "topic": topic,
-                "consumer_id": consumer_id,
-                "group_id": group_id,
-                "from_offset": from_offset,
-                "max_records": max_records,
-                "timeout_ms": timeout_ms,
-            },
+            params,
         )
 
     # Local owner fast path
@@ -753,6 +757,14 @@ async def poll(
 async def commit(c: CommitRequest):
     if c.offset < -1:
         raise HTTPException(status_code=400, detail="invalid offset")
+    await _refresh_owner_cache_if_needed()
+    owner = _owner_for(c.topic)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Topic not found (no owner)")
+    if owner != BROKER_ID:
+        base = _owner_base(owner)
+        print(f"[P{BROKER_ID}] routing commit for topic={c.topic} to P{owner}")
+        return await _proxy_post(base, "/commit", c.model_dump())
     _commit(c.topic, c.consumer_id, c.group_id, c.offset)
     return {"topic": c.topic, "committed": c.offset}
 
