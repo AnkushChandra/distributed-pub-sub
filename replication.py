@@ -41,10 +41,15 @@ async def _refresh_metadata() -> None:
     await _refresh_fn()
 
 
-async def follower_replication_loop(poll_interval: float = 0.5, batch_size: int = 100) -> None:
+async def follower_replication_loop(
+    poll_interval: float = 0.5,
+    batch_size: int = 100,
+    max_backoff: float = 5.0,
+) -> None:
     if _get_snapshot is None or _refresh_fn is None:
         raise RuntimeError("replication.setup() must be called before starting the loop")
     print(f"[Broker {_BROKER_ID}] follower replication loop running")
+    backoff = poll_interval
     while True:
         try:
             await _refresh_metadata()
@@ -73,7 +78,11 @@ async def follower_replication_loop(poll_interval: float = 0.5, batch_size: int 
                     async with httpx.AsyncClient(timeout=3.0) as client:
                         resp = await client.get(
                             f"{base}/internal/topics/{topic}/fetch",
-                            params={"offset": fetch_offset, "max_batch": batch_size},
+                            params={
+                                "offset": fetch_offset,
+                                "max_batch": batch_size,
+                                "include_commits": True,
+                            },
                         )
                         if resp.status_code == 404:
                             continue
@@ -97,6 +106,9 @@ async def follower_replication_loop(poll_interval: float = 0.5, batch_size: int 
                         rec.get("value"),
                         rec.get("headers") or {},
                     )
+                storage.apply_commit_snapshot(data.get("commits") or {})
+            backoff = poll_interval
         except Exception as e:
             print(f"[Broker {_BROKER_ID}] replication loop error: {e}")
-        await asyncio.sleep(poll_interval)
+            backoff = min(max_backoff, backoff * 2)
+        await asyncio.sleep(backoff)

@@ -1,4 +1,4 @@
-# bully_impl.py
+# bully.py
 import json
 import socket
 import threading

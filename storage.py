@@ -3,7 +3,11 @@ from __future__ import annotations
 import json, os, sqlite3, threading, time, pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
-DATA_DIR = pathlib.Path(os.getenv("PUBSUB_DATA_DIR", "data")).resolve()
+from config import BROKER_ID
+
+_data_dir_env = os.getenv("PUBSUB_DATA_DIR")
+_data_dir_default = f"data{BROKER_ID}" if BROKER_ID is not None else "data"
+DATA_DIR = pathlib.Path(_data_dir_env or _data_dir_default).resolve()
 DB_PATH = DATA_DIR / "pubsub.sqlite"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -121,6 +125,31 @@ def set_commit(topic: str, consumer_id: Optional[str], group_id: Optional[str], 
             "INSERT INTO commits(k, offset) VALUES(?, ?) "
             "ON CONFLICT(k) DO UPDATE SET offset=excluded.offset", (k, int(offset))
         )
+
+def commit_entries_for_topic(topic: str) -> Dict[str, int]:
+    prefix = f"{topic}|%"
+    with _lock:
+        rows = _conn.execute(
+            "SELECT k, offset FROM commits WHERE k LIKE ?",
+            (prefix,)
+        ).fetchall()
+    return {str(k): int(offset) for k, offset in rows}
+
+
+def apply_commit_snapshot(entries: Dict[str, int]) -> None:
+    if not entries:
+        return
+    with _lock:
+        for key, offset in entries.items():
+            if not isinstance(key, str):
+                continue
+            if "|" not in key:
+                continue
+            _conn.execute(
+                "INSERT INTO commits(k, offset) VALUES(?, ?) "
+                "ON CONFLICT(k) DO UPDATE SET offset=excluded.offset",
+                (key, int(offset)),
+            )
 
 # ---- replication helpers ----
 
