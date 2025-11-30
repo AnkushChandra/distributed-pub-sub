@@ -5,6 +5,7 @@ from typing import Dict
 # -------------------- Broker identity & API peers --------------------
 # This node's ID (must match bully.CONFIG ids)
 BROKER_ID = int(os.getenv("BROKER_ID", "1"))
+MIN_SYNC_FOLLOWERS = max(0, int(os.getenv("MIN_SYNC_FOLLOWERS", "1")))
 
 # Map broker id -> API base URL (used for routing/proxying)
 # You can override with JSON in BROKER_API_PEERS='{"1":"http://127.0.0.1:8081",...}'

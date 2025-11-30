@@ -12,6 +12,7 @@ GossipHandlerFn = Callable[[Dict[str, Any]], None]
 AsyncCallable = Callable[[], Awaitable[None]]
 TopicsProviderFn = Callable[[], Iterable[str]]
 PromoteTopicFn = Callable[[str], None]
+SyncIsrFn = Callable[[str], None]
 
 _BROKER_ID: int = 0
 _BROKER_API: Dict[int, str] = {}
@@ -24,6 +25,7 @@ _refresh_owner_cache_fn: Optional[AsyncCallable] = None
 _is_leader_fn: Optional[Callable[[], bool]] = None
 _topics_provider_fn: Optional[TopicsProviderFn] = None
 _promote_topic_fn: Optional[PromoteTopicFn] = None
+_sync_isr_fn: Optional[SyncIsrFn] = None
 
 _configured: bool = False
 
@@ -33,6 +35,8 @@ _gossip_http: Optional[aiohttp.ClientSession] = None
 _replication_task: Optional[asyncio.Task] = None
 _metadata_sync_task: Optional[asyncio.Task] = None
 _failover_task: Optional[asyncio.Task] = None
+_isr_task: Optional[asyncio.Task] = None
+_leader_watch_task: Optional[asyncio.Task] = None
 
 
 def configure_lifecycle(
@@ -48,11 +52,12 @@ def configure_lifecycle(
     is_leader_fn: Callable[[], bool],
     topics_provider_fn: TopicsProviderFn,
     promote_topic_fn: PromoteTopicFn,
+    sync_isr_fn: SyncIsrFn,
 ) -> None:
     global _BROKER_ID, _BROKER_API, _peer_map_fn, _self_api_base_fn
     global _gossip_payload_fn, _handle_gossip_payload_fn
     global _placement_getter, _refresh_owner_cache_fn, _is_leader_fn
-    global _topics_provider_fn, _promote_topic_fn, _configured
+    global _topics_provider_fn, _promote_topic_fn, _sync_isr_fn, _configured
 
     _BROKER_ID = broker_id
     _BROKER_API = dict(broker_api)
@@ -65,6 +70,7 @@ def configure_lifecycle(
     _is_leader_fn = is_leader_fn
     _topics_provider_fn = topics_provider_fn
     _promote_topic_fn = promote_topic_fn
+    _sync_isr_fn = sync_isr_fn
 
     replication.setup(
         broker_id=_BROKER_ID,
@@ -91,9 +97,13 @@ async def lifecycle_startup() -> None:
     await _start_replication()
     await _start_metadata_sync()
     await _start_failover_monitor()
+    await _start_isr_monitor()
+    await _start_leader_watch()
 
 
 async def lifecycle_shutdown() -> None:
+    await _stop_leader_watch()
+    await _stop_isr_monitor()
     await _stop_failover_monitor()
     await _stop_metadata_sync()
     await _stop_replication()
@@ -190,6 +200,44 @@ async def _metadata_sync_loop() -> None:
             await asyncio.sleep(2.0)
 
 
+async def _start_leader_watch() -> None:
+    global _leader_watch_task
+    if _leader_watch_task is not None:
+        return
+    _leader_watch_task = asyncio.create_task(_leader_watch_loop())
+
+
+async def _stop_leader_watch() -> None:
+    global _leader_watch_task
+    task = _leader_watch_task
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    _leader_watch_task = None
+
+
+async def _leader_watch_loop() -> None:
+    assert _refresh_owner_cache_fn is not None
+    assert _is_leader_fn is not None
+    was_leader = False
+    while True:
+        try:
+            is_leader = _is_leader_fn()
+            if is_leader and not was_leader:
+                await _refresh_owner_cache_fn(force=True)
+            was_leader = is_leader
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"[Broker {_BROKER_ID}] leader watch error: {exc}")
+            await asyncio.sleep(1.0)
+
+
 async def _start_failover_monitor() -> None:
     global _failover_task
     if _failover_task is not None:
@@ -224,4 +272,41 @@ async def _failover_loop() -> None:
             break
         except Exception as exc:
             print(f"[Broker {_BROKER_ID}] failover monitor error: {exc}")
+            await asyncio.sleep(1.0)
+
+
+async def _start_isr_monitor() -> None:
+    global _isr_task
+    if _isr_task is not None:
+        return
+    _isr_task = asyncio.create_task(_isr_loop())
+
+
+async def _stop_isr_monitor() -> None:
+    global _isr_task
+    task = _isr_task
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    _isr_task = None
+
+
+async def _isr_loop() -> None:
+    assert _is_leader_fn is not None
+    assert _topics_provider_fn is not None
+    assert _sync_isr_fn is not None
+    while True:
+        try:
+            if _is_leader_fn():
+                for topic in _topics_provider_fn():
+                    _sync_isr_fn(topic)
+            await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"[Broker {_BROKER_ID}] ISR monitor error: {exc}")
             await asyncio.sleep(1.0)

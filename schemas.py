@@ -28,3 +28,10 @@ class GossipPushPullRequest(BaseModel):
     from_addr: str
     membership: List[Dict[str, Any]] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ReplicateRequest(BaseModel):
+    offset: int
+    key: Optional[str] = None
+    value: Any
+    headers: Dict[str, Any] = Field(default_factory=dict)

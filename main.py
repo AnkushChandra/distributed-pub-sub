@@ -11,7 +11,8 @@ import httpx
 from fastapi import FastAPI, HTTPException
 
 import storage as st
-from config import BROKER_API, BROKER_ID, peer_map, self_api_base
+import replication
+from config import BROKER_API, BROKER_ID, MIN_SYNC_FOLLOWERS, peer_map, self_api_base
 from election import (
     get_leader_id,
     is_cluster_leader,
@@ -28,6 +29,7 @@ from metadata_store import (
     TOPIC_PLACEMENTS,
     cache_is_fresh,
     followers_for,
+    isr_for,
     mark_cache_fresh,
     maybe_update_metadata,
     maybe_update_metadata_from_remote,
@@ -35,6 +37,7 @@ from metadata_store import (
     metadata_version,
     normalize_placement,
     owner_for,
+    set_topic_isr,
     set_topic_placement,
 )
 from admin_routes import build_admin_router
@@ -52,6 +55,9 @@ from notifier import (
 app = FastAPI(title="Mini Pub/Sub (SQLite + Bully + Routed Reads)")
 
 _lifecycle_configured = False
+_topic_owner_offsets: Dict[str, int] = {}
+_last_isr_status: Dict[str, Dict[str, Any]] = {}
+_isr_status_lock = threading.Lock()
 
 
 def _gossip_payload() -> Dict[str, Any]:
@@ -129,6 +135,129 @@ def _broker_is_alive(bid: int) -> bool:
         return False
     return member.status == "alive"
 
+def _local_topic_offset(topic: str) -> int:
+    st.init_topic(topic)
+    return st.latest_offset(topic)
+
+
+def _fetch_topic_offset(bid: int, topic: str) -> Optional[int]:
+    if bid == BROKER_ID:
+        return _local_topic_offset(topic)
+    if not _broker_is_alive(bid):
+        return None
+    base = BROKER_API.get(bid)
+    if not base:
+        return None
+    url = f"{base}/internal/topics/{topic}/status"
+    try:
+        resp = httpx.get(url, timeout=1.0)
+        resp.raise_for_status()
+        body = resp.json()
+        latest = body.get("latest_offset", -1)
+        return int(latest)
+    except Exception:
+        return None
+
+
+def _topic_offsets_snapshot(topic: str) -> Dict[int, int]:
+    offsets: Dict[int, int] = {}
+    local = _local_topic_offset(topic)
+    offsets[BROKER_ID] = local
+    with httpx.Client(timeout=1.0) as client:
+        for bid, base in BROKER_API.items():
+            if bid == BROKER_ID or not _broker_is_alive(bid):
+                continue
+            url = f"{base}/internal/topics/{topic}/status"
+            try:
+                resp = client.get(url)
+                resp.raise_for_status()
+                latest = int(resp.json().get("latest_offset", -1))
+            except Exception:
+                continue
+            offsets[bid] = latest
+    return offsets
+
+
+def _record_owner_offset(topic: str, owner_id: int) -> None:
+    latest = _fetch_topic_offset(owner_id, topic)
+    if latest is not None:
+        _topic_owner_offsets[topic] = latest
+
+
+def _current_owner_offset(topic: str, owner_id: int) -> Optional[int]:
+    if owner_id == BROKER_ID:
+        latest = _local_topic_offset(topic)
+    else:
+        latest = _fetch_topic_offset(owner_id, topic)
+    if latest is not None:
+        _topic_owner_offsets[topic] = latest
+    return latest
+
+
+def _record_committed_offset(topic: str, offset: int) -> None:
+    current = _topic_owner_offsets.get(topic, -1)
+    if offset > current:
+        _topic_owner_offsets[topic] = offset
+
+
+def _sync_isr_membership(topic: str) -> None:
+    if not is_cluster_leader():
+        return
+    placement = TOPIC_PLACEMENTS.get(topic)
+    if not placement:
+        return
+    owner = placement.get("owner")
+    if owner is None:
+        return
+    owner_id = int(owner)
+    owner_offset = _current_owner_offset(topic, owner_id)
+    if owner_offset is None:
+        return
+    current_isr = isr_for(topic, leader_view=True)
+    followers_raw = list(placement.get("followers", []))
+    followers_full = list(followers_raw)
+    followers_alive: List[int] = []
+    for follower in followers_raw:
+        try:
+            fid = int(follower)
+        except (TypeError, ValueError):
+            continue
+        if _broker_is_alive(fid):
+            followers_alive.append(fid)
+
+    desired_isr: List[int] = [owner_id]
+    for fid in followers_alive:
+        follower_offset = _fetch_topic_offset(fid, topic)
+        if follower_offset is None:
+            continue
+        if follower_offset >= owner_offset:
+            desired_isr.append(fid)
+
+    target_followers = max(len(followers_raw), MIN_SYNC_FOLLOWERS)
+    candidate_pool = [
+        bid
+        for bid in _alive_brokers()
+        if bid != owner_id and bid not in followers_alive
+    ]
+    random.shuffle(candidate_pool)
+    replacements_added = False
+    while len(followers_alive) < target_followers and candidate_pool:
+        new_follower = candidate_pool.pop()
+        followers_alive.append(new_follower)
+        if new_follower not in followers_full:
+            followers_full.append(new_follower)
+        replacements_added = True
+
+    followers_changed = replacements_added or (
+        sorted(followers_full) != sorted(followers_raw)
+    )
+
+    if desired_isr == current_isr and not followers_changed:
+        return
+
+    set_topic_placement(topic, owner_id, followers_full, desired_isr)
+
+
 def _maybe_promote_topic_owner(topic: str) -> None:
     if not is_cluster_leader():
         return
@@ -136,18 +265,40 @@ def _maybe_promote_topic_owner(topic: str) -> None:
     if not placement:
         return
     owner = placement.get("owner")
-    if owner is None or _broker_is_alive(int(owner)):
+    if owner is None:
+        return
+    owner_id = int(owner)
+    if _broker_is_alive(owner_id):
+        _record_owner_offset(topic, owner_id)
         return
     followers = list(placement.get("followers", []))
-    for candidate in followers:
-        if _broker_is_alive(candidate):
-            new_followers = [f for f in followers if f != candidate]
-            new_followers.append(int(owner))
-            set_topic_placement(topic, candidate, new_followers)
-            if candidate == BROKER_ID:
-                st.init_topic(topic)
-            print(f"[P{BROKER_ID}] promoted topic={topic} owner -> P{candidate}")
-            return
+    isr_members = [mid for mid in isr_for(topic, leader_view=True) if mid != owner_id]
+    if not isr_members:
+        return
+    offsets = _topic_offsets_snapshot(topic)
+    required = _topic_owner_offsets.get(topic, -1)
+    current_max = max(offsets.values(), default=-1)
+    target_offset = max(required, current_max)
+    for candidate in isr_members:
+        if not _broker_is_alive(candidate):
+            continue
+        candidate_offset = offsets.get(candidate)
+        if candidate_offset is None:
+            candidate_offset = _fetch_topic_offset(candidate, topic)
+        if candidate_offset is None:
+            continue
+        if candidate_offset < target_offset:
+            continue
+        new_followers = [f for f in followers if f != candidate]
+        new_followers.append(owner_id)
+        set_topic_placement(topic, candidate, new_followers)
+        if candidate == BROKER_ID:
+            st.init_topic(topic)
+        print(
+            f"[P{BROKER_ID}] promoted topic={topic} owner -> P{candidate} "
+            f"(offset {candidate_offset}, target {target_offset})"
+        )
+        return
 
 def _owner_api_base(owner_id: int) -> str:
     base = BROKER_API.get(int(owner_id))
@@ -162,10 +313,13 @@ def _get_leader_api() -> str:
     return BROKER_API[leader_id]
 
 async def _refresh_owner_cache_if_needed(*, force: bool = False):
-    if is_cluster_leader():
-        return
     now = time.time()
     if not force and cache_is_fresh(now):
+        return
+    if is_cluster_leader():
+        updated = await _pull_best_metadata_from_peers()
+        if updated:
+            mark_cache_fresh(time.time())
         return
     try:
         leader_api = _get_leader_api()
@@ -194,12 +348,119 @@ async def _refresh_owner_cache_if_needed(*, force: bool = False):
     if updated:
         mark_cache_fresh(time.time())
 
+
+async def _pull_best_metadata_from_peers() -> bool:
+    """When we are (or become) leader, adopt the freshest snapshot we can find."""
+    best: Optional[Tuple[int, Dict[str, Placement]]] = None
+    current_version = metadata_version()
+    async with httpx.AsyncClient(timeout=3.0) as client:
+        for bid, base in BROKER_API.items():
+            if bid == BROKER_ID:
+                continue
+            try:
+                resp = await client.get(f"{base}/metadata")
+                resp.raise_for_status()
+                body = resp.json()
+            except Exception:
+                continue
+            version = body.get("version")
+            topics = body.get("topics")
+            if topics is None or version is None:
+                continue
+            try:
+                version_int = int(version)
+            except (TypeError, ValueError):
+                continue
+            if version_int <= current_version:
+                continue
+            snapshot = {str(topic): normalize_placement(entry) for topic, entry in topics.items()}
+            if best is None or version_int > best[0]:
+                best = (version_int, snapshot)
+    if not best:
+        return False
+    version_int, snapshot = best
+    return maybe_update_metadata(snapshot, version_int, persist=True)
+
 def _local_is_owner(topic: str) -> bool:
     owner = owner_for(topic)
     return owner == BROKER_ID
 
 def _topics_iter() -> List[str]:
     return list(TOPIC_PLACEMENTS.keys())
+
+
+def _isr_members(topic: str) -> List[int]:
+    return isr_for(topic, leader_view=True)
+
+
+async def _replicate_to_isr(topic: str, offset: int, key, value, headers):
+    placement = TOPIC_PLACEMENTS.get(topic)
+    if not placement:
+        return {
+            "acks": {},
+            "required_sync": 0,
+            "success_count": 0,
+            "quorum_met": True,
+        }
+    isr_members = isr_for(topic, leader_view=True)
+    follower_targets = [mid for mid in isr_members if mid != BROKER_ID]
+    required_sync = min(MIN_SYNC_FOLLOWERS, len(follower_targets))
+    results = await replication.replicate_to_followers(
+        topic=topic,
+        offset=offset,
+        key=key,
+        value=value,
+        headers=headers,
+        follower_ids=follower_targets,
+    )
+    failed = [fid for fid in follower_targets if not results.get(fid, False)]
+    if failed:
+        updated = [mid for mid in isr_members if mid not in failed]
+        if updated:
+            set_topic_isr(topic, updated)
+    success_count = len([fid for fid in follower_targets if results.get(fid, False)])
+    quorum_met = success_count >= required_sync
+    pending = [fid for fid in follower_targets if not results.get(fid, False)]
+    status_payload = {
+        "timestamp": time.time(),
+        "owner_id": BROKER_ID,
+        "topic": topic,
+        "acks": results,
+        "pending": pending,
+        "required_sync": required_sync,
+        "success_count": success_count,
+        "quorum_met": quorum_met,
+        "targets": follower_targets,
+    }
+    with _isr_status_lock:
+        _last_isr_status[topic] = status_payload
+    return status_payload
+
+
+def _isr_status_snapshot() -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {}
+    with _isr_status_lock:
+        last_status = {topic: dict(data) for topic, data in _last_isr_status.items()}
+    for topic, placement in TOPIC_PLACEMENTS.items():
+        owner = placement.get("owner")
+        followers = placement.get("followers", [])
+        isr_members = placement.get("isr", [])
+        members = []
+        if owner is not None:
+            members.append(int(owner))
+        members.extend(int(f) for f in followers)
+        alive_view = {mid: _broker_is_alive(mid) for mid in members}
+        topic_status = {
+            "owner": owner,
+            "followers": followers,
+            "isr": isr_members,
+            "alive": alive_view,
+            "min_sync_followers": MIN_SYNC_FOLLOWERS,
+        }
+        if owner == BROKER_ID and topic in last_status:
+            topic_status["last_publish"] = last_status[topic]
+        snapshot[topic] = topic_status
+    return snapshot
 
 
 def _configure_lifecycle_once():
@@ -218,6 +479,7 @@ def _configure_lifecycle_once():
         is_leader_fn=is_cluster_leader,
         topics_provider_fn=_topics_iter,
         promote_topic_fn=_maybe_promote_topic_owner,
+        sync_isr_fn=_sync_isr_membership,
     )
     _lifecycle_configured = True
 
@@ -244,6 +506,7 @@ app.include_router(
         refresh_owner_cache_fn=_refresh_owner_cache_if_needed,
         alive_brokers_fn=_alive_brokers,
         select_followers_fn=_select_followers,
+        isr_status_fn=_isr_status_snapshot,
     )
 )
 app.include_router(
@@ -254,6 +517,8 @@ app.include_router(
         owner_base_fn=_owner_api_base,
         append_record_fn=st.append_record,
         poll_records_fn=st.poll_records,
+        isr_members_fn=_isr_members,
+        replicate_to_isr_fn=_replicate_to_isr,
     )
 )
 app.include_router(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -20,6 +20,7 @@ from schemas import GossipPushPullRequest
 AsyncRefreshFn = Callable[[], Awaitable[None]]
 AliveFn = Callable[[], List[int]]
 SelectFollowersFn = Callable[[int, int], List[int]]
+IsrStatusFn = Callable[[], Dict[str, Any]]
 
 
 def build_admin_router(
@@ -27,6 +28,7 @@ def build_admin_router(
     refresh_owner_cache_fn: AsyncRefreshFn,
     alive_brokers_fn: AliveFn,
     select_followers_fn: SelectFollowersFn,
+    isr_status_fn: IsrStatusFn,
 ):
     router = APIRouter()
 
@@ -56,6 +58,16 @@ def build_admin_router(
             "leader_id": get_leader_id(),
             "version": meta.get("version", 0),
             "topics": topics_out,
+        }
+
+    @router.get("/admin/isr")
+    async def isr_status():
+        if not is_cluster_leader():
+            await refresh_owner_cache_fn(force=True)
+        snapshot = isr_status_fn()
+        return {
+            "leader_id": get_leader_id(),
+            "topics": snapshot,
         }
 
     @router.post("/admin/topics")

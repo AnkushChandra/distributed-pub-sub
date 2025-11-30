@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 
 import storage as st
+from schemas import ReplicateRequest
 
 
 def build_internal_router(*, owner_for_fn, broker_id: int) -> APIRouter:
@@ -22,5 +23,21 @@ def build_internal_router(*, owner_for_fn, broker_id: int) -> APIRouter:
         if include_commits:
             response["commits"] = st.commit_entries_for_topic(topic)
         return response
+
+    @router.get("/internal/topics/{topic}/status")
+    async def topic_status(topic: str):
+        st.init_topic(topic)
+        latest = st.latest_offset(topic)
+        return {"latest_offset": latest}
+
+    @router.post("/internal/topics/{topic}/replicate")
+    async def replicate_record_endpoint(topic: str, req: ReplicateRequest):
+        owner = owner_for_fn(topic)
+        if owner == broker_id:
+            raise HTTPException(status_code=409, detail="NOT_FOLLOWER")
+        if req.offset < 0:
+            raise HTTPException(status_code=400, detail="invalid offset")
+        st.replicate_record(topic, req.offset, req.key, req.value, req.headers)
+        return {"status": "ok", "offset": req.offset}
 
     return router

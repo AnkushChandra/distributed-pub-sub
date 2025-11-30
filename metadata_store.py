@@ -9,6 +9,18 @@ from election import is_cluster_leader
 
 Placement = Dict[str, Any]
 
+
+def _normalize_member_list(members) -> List[int]:
+    if not members:
+        return []
+    cleaned: List[int] = []
+    for entry in members:
+        try:
+            cleaned.append(int(entry))
+        except (TypeError, ValueError):
+            continue
+    return sorted(dict.fromkeys(cleaned))
+
 TOPIC_METADATA_FILE = st.DATA_DIR / "topics.json"
 _topic_meta_lock = threading.RLock()
 _metadata_version: int = 0
@@ -22,9 +34,11 @@ _placement_cache_expiry: float = 0.0
 def normalize_placement(entry: Any) -> Placement:
     owner = None
     followers: List[int] = []
+    isr: List[int] = []
     if isinstance(entry, dict):
         owner = entry.get("owner")
         followers = entry.get("followers", [])
+        isr = entry.get("isr", [])
     elif isinstance(entry, list) and entry:
         owner = entry[0]
         followers = entry[1:]
@@ -35,14 +49,9 @@ def normalize_placement(entry: Any) -> Placement:
         owner_int = int(owner)
     except (TypeError, ValueError):
         owner_int = None
-    follower_ints: List[int] = []
-    for f in followers:
-        try:
-            follower_ints.append(int(f))
-        except (TypeError, ValueError):
-            continue
-    deduped = sorted(dict.fromkeys(follower_ints))
-    return {"owner": owner_int, "followers": deduped}
+    deduped_followers = _normalize_member_list(followers)
+    deduped_isr = _normalize_member_list(isr if isr else followers)
+    return {"owner": owner_int, "followers": deduped_followers, "isr": deduped_isr}
 
 
 def clone_placements(src: Dict[str, Placement]) -> Dict[str, Placement]:
@@ -50,6 +59,7 @@ def clone_placements(src: Dict[str, Placement]) -> Dict[str, Placement]:
         str(topic): {
             "owner": placement.get("owner"),
             "followers": list(placement.get("followers", [])),
+            "isr": list(placement.get("isr", [])),
         }
         for topic, placement in src.items()
     }
@@ -132,6 +142,26 @@ def followers_for(topic: str, *, leader_view: bool = False) -> List[int]:
     return list(followers) if isinstance(followers, list) else []
 
 
+def isr_for(topic: str, *, leader_view: bool = False) -> List[int]:
+    src = TOPIC_PLACEMENTS if leader_view else placement_source()
+    placement = src.get(topic)
+    if not placement:
+        return []
+    members = placement.get("isr")
+    if members is None:
+        # fall back to owner + followers ordering
+        owner = placement.get("owner")
+        base = []
+        if owner is not None:
+            try:
+                base.append(int(owner))
+            except (TypeError, ValueError):
+                pass
+        base.extend(followers_for(topic, leader_view=leader_view))
+        return base
+    return list(members) if isinstance(members, list) else []
+
+
 def maybe_update_metadata(snapshot: Dict[str, Placement], version: int, *, persist: bool) -> bool:
     global _metadata_version
     with _topic_meta_lock:
@@ -157,9 +187,15 @@ def maybe_update_metadata_from_remote(meta: Dict[str, Any]) -> bool:
     return maybe_update_metadata(snapshot, version_int, persist=True)
 
 
-def set_topic_placement(topic: str, owner_id: int, followers: Optional[List[int]] = None):
-    followers_list = sorted(dict.fromkeys(int(f) for f in (followers or []) if f is not None))
-    placement = {"owner": int(owner_id), "followers": followers_list}
+def set_topic_placement(
+    topic: str,
+    owner_id: int,
+    followers: Optional[List[int]] = None,
+    isr: Optional[List[int]] = None,
+):
+    followers_list = _normalize_member_list(followers or [])
+    isr_list = _normalize_member_list(isr if isr is not None else [owner_id, *followers_list])
+    placement = {"owner": int(owner_id), "followers": followers_list, "isr": isr_list}
     with _topic_meta_lock:
         snapshot = clone_placements(TOPIC_PLACEMENTS)
         snapshot[topic] = placement
@@ -169,7 +205,22 @@ def set_topic_placement(topic: str, owner_id: int, followers: Optional[List[int]
 
 def set_topic_owner(topic: str, owner_id: int):
     followers = followers_for(topic, leader_view=True)
-    set_topic_placement(topic, owner_id, followers)
+    isr_members = isr_for(topic, leader_view=True)
+    if owner_id not in isr_members:
+        isr_members = [owner_id, *followers]
+    set_topic_placement(topic, owner_id, followers, isr_members)
+
+
+def set_topic_isr(topic: str, members: List[int]):
+    isr_list = _normalize_member_list(members)
+    with _topic_meta_lock:
+        snapshot = clone_placements(TOPIC_PLACEMENTS)
+        current = snapshot.get(topic)
+        if not current:
+            return
+        current["isr"] = isr_list
+        version = _metadata_version + 1
+    apply_metadata_snapshot(snapshot, version, persist=True)
 
 
 def cache_is_fresh(now: float) -> bool:

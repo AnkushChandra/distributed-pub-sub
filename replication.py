@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 import httpx
 
@@ -27,6 +27,44 @@ def setup(
     _BROKER_API = dict(broker_api)
     _get_snapshot = placement_getter
     _refresh_fn = refresh_fn
+
+
+async def replicate_to_followers(
+    *,
+    topic: str,
+    offset: int,
+    key: Optional[str],
+    value: Any,
+    headers: Dict[str, Any],
+    follower_ids: Iterable[int],
+    timeout: float = 3.0,
+) -> Dict[int, bool]:
+    """Push a record to the given followers and return ack status per follower."""
+    results: Dict[int, bool] = {}
+    ids = [int(fid) for fid in follower_ids if fid is not None and int(fid) != _BROKER_ID]
+    if not ids:
+        return results
+    payload = {
+        "offset": int(offset),
+        "key": key,
+        "value": value,
+        "headers": headers or {},
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for fid in ids:
+            base = _BROKER_API.get(fid)
+            if not base:
+                results[fid] = False
+                continue
+            url = f"{base}/internal/topics/{topic}/replicate"
+            try:
+                resp = await client.post(url, json=payload)
+                resp.raise_for_status()
+                results[fid] = True
+            except Exception as exc:
+                print(f"[Broker {_BROKER_ID}] replicate push to P{fid} failed: {exc}")
+                results[fid] = False
+    return results
 
 
 def _placements() -> PlacementSnapshot:

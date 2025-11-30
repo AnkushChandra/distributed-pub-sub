@@ -17,6 +17,8 @@ def build_client_router(
     owner_base_fn,
     append_record_fn,
     poll_records_fn,
+    isr_members_fn,
+    replicate_to_isr_fn,
 ):
     router = APIRouter()
 
@@ -74,8 +76,29 @@ def build_client_router(
             base = owner_base_fn(owner)
             return await _proxy_post(base, f"/topics/{topic}/publish", req.model_dump())
         off = append_record_fn(topic, req.key, req.value, req.headers)
+        repl_result = await replicate_to_isr_fn(topic, off, req.key, req.value, req.headers)
+        if not repl_result.get("quorum_met", True):
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error": "ISR_REPLICATION_FAILED",
+                    "acks": repl_result.get("acks", {}),
+                    "required_sync": repl_result.get("required_sync", 0),
+                    "success_count": repl_result.get("success_count", 0),
+                },
+            )
         await get_notifier(topic).notify()
-        return {"topic": topic, "offset": off}
+        try:
+            record_committed = globals().get("_record_committed_offset")
+            if callable(record_committed):
+                record_committed(topic, off)
+        except Exception:
+            pass
+        return {
+            "topic": topic,
+            "offset": off,
+            "isr": isr_members_fn(topic),
+        }
 
     @router.post("/subscribe")
     async def subscribe(sub: SubscribeRequest):
