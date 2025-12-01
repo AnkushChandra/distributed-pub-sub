@@ -143,8 +143,6 @@ def _local_topic_offset(topic: str) -> int:
 def _fetch_topic_offset(bid: int, topic: str) -> Optional[int]:
     if bid == BROKER_ID:
         return _local_topic_offset(topic)
-    if not _broker_is_alive(bid):
-        return None
     base = BROKER_API.get(bid)
     if not base:
         return None
@@ -165,7 +163,7 @@ def _topic_offsets_snapshot(topic: str) -> Dict[int, int]:
     offsets[BROKER_ID] = local
     with httpx.Client(timeout=1.0) as client:
         for bid, base in BROKER_API.items():
-            if bid == BROKER_ID or not _broker_is_alive(bid):
+            if bid == BROKER_ID:
                 continue
             url = f"{base}/internal/topics/{topic}/status"
             try:
@@ -222,8 +220,7 @@ def _sync_isr_membership(topic: str) -> None:
             fid = int(follower)
         except (TypeError, ValueError):
             continue
-        if _broker_is_alive(fid):
-            followers_alive.append(fid)
+        followers_alive.append(fid)
 
     desired_isr: List[int] = [owner_id]
     for fid in followers_alive:
@@ -268,8 +265,9 @@ def _maybe_promote_topic_owner(topic: str) -> None:
     if owner is None:
         return
     owner_id = int(owner)
-    if _broker_is_alive(owner_id):
-        _record_owner_offset(topic, owner_id)
+    owner_offset = _fetch_topic_offset(owner_id, topic)
+    if owner_offset is not None:
+        _topic_owner_offsets[topic] = owner_offset
         return
     followers = list(placement.get("followers", []))
     isr_members = [mid for mid in isr_for(topic, leader_view=True) if mid != owner_id]
@@ -280,8 +278,6 @@ def _maybe_promote_topic_owner(topic: str) -> None:
     current_max = max(offsets.values(), default=-1)
     target_offset = max(required, current_max)
     for candidate in isr_members:
-        if not _broker_is_alive(candidate):
-            continue
         candidate_offset = offsets.get(candidate)
         if candidate_offset is None:
             candidate_offset = _fetch_topic_offset(candidate, topic)
