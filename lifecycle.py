@@ -82,6 +82,12 @@ def configure_lifecycle(
     _configured = True
 
 
+def update_broker_api(peers: Dict[int, str]) -> None:
+    global _BROKER_API
+    _BROKER_API = dict(peers)
+    replication.update_broker_api(_BROKER_API)
+
+
 def get_gossip_state() -> Optional[gossip.GossipState]:
     return _gossip_state
 

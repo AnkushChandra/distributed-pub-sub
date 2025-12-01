@@ -35,3 +35,14 @@ class ReplicateRequest(BaseModel):
     key: Optional[str] = None
     value: Any
     headers: Dict[str, Any] = Field(default_factory=dict)
+
+
+class BrokerEndpoint(BaseModel):
+    broker_id: int
+    api_base: str
+    election_host: str
+    election_port: int
+
+
+class DiscoveryUpdateRequest(BaseModel):
+    brokers: List[BrokerEndpoint] = Field(default_factory=list)

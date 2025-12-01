@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 import storage as st
 import replication
 from config import BROKER_API, BROKER_ID, MIN_SYNC_FOLLOWERS, peer_map, self_api_base
+from discovery_client import register_with_discovery, seed_local_endpoint
 from election import (
     get_leader_id,
     is_cluster_leader,
@@ -58,6 +59,8 @@ _lifecycle_configured = False
 _topic_owner_offsets: Dict[str, int] = {}
 _last_isr_status: Dict[str, Dict[str, Any]] = {}
 _isr_status_lock = threading.Lock()
+
+seed_local_endpoint()
 
 
 def _gossip_payload() -> Dict[str, Any]:
@@ -485,6 +488,7 @@ def _configure_lifecycle_once():
 
 @app.on_event("startup")
 async def _on_startup():
+    await register_with_discovery()
     start_election_service()
     _configure_lifecycle_once()
     await lifecycle_startup()

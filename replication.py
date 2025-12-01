@@ -15,6 +15,11 @@ _get_snapshot: Optional[Callable[[], PlacementSnapshot]] = None
 _refresh_fn: Optional[Callable[[], Awaitable[None]]] = None
 
 
+def _set_broker_api(peers: Dict[int, str]) -> None:
+    global _BROKER_API
+    _BROKER_API = dict(peers)
+
+
 def setup(
     *,
     broker_id: int,
@@ -22,11 +27,15 @@ def setup(
     placement_getter: Callable[[], PlacementSnapshot],
     refresh_fn: Callable[[], Awaitable[None]],
 ) -> None:
-    global _BROKER_ID, _BROKER_API, _get_snapshot, _refresh_fn
+    global _BROKER_ID, _get_snapshot, _refresh_fn
     _BROKER_ID = broker_id
-    _BROKER_API = dict(broker_api)
+    _set_broker_api(broker_api)
     _get_snapshot = placement_getter
     _refresh_fn = refresh_fn
+
+
+def update_broker_api(peers: Dict[int, str]) -> None:
+    _set_broker_api(peers)
 
 
 async def replicate_to_followers(

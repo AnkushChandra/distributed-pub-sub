@@ -10,23 +10,61 @@ HEARTBEAT_TIMEOUT = 3.0
 ELECTION_OK_TIMEOUT = 3.0
 COORDINATOR_TIMEOUT = 5.0
 
-# You can change these or load from env/config file
-CONFIG: Dict[int, Tuple[str, int]] = {
-    1: ("127.0.0.1", 5001),
-    2: ("127.0.0.1", 5002),
-    3: ("127.0.0.1", 5003),
-    4: ("127.0.0.1", 5004),
-    5: ("127.0.0.1", 5005),
-}
+# Discovery now owns membership. Brokers learn peers dynamically.
+CONFIG: Dict[int, Tuple[str, int]] = {}
+_CONFIG_LOCK = threading.Lock()
+_ACTIVE_NODES: Dict[int, "ProcessNode"] = {}
+
+
+def _normalize_peer_map(peers: Dict[object, object]) -> Dict[int, Tuple[str, int]]:
+    normalized: Dict[int, Tuple[str, int]] = {}
+    for key, value in peers.items():
+        try:
+            pid = int(key)
+        except (TypeError, ValueError):
+            continue
+        host: Optional[str]
+        port: Optional[int]
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            host, port = value  # type: ignore[assignment]
+        elif isinstance(value, dict):
+            host = value.get("host") or value.get("election_host")
+            port = value.get("port") or value.get("election_port")
+        else:
+            continue
+        if host is None or port is None:
+            continue
+        try:
+            normalized[pid] = (str(host), int(port))
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+def update_peer_config(peers: Dict[object, object]) -> None:
+    normalized = _normalize_peer_map(peers)
+    with _CONFIG_LOCK:
+        CONFIG.clear()
+        CONFIG.update(normalized)
+        nodes = list(_ACTIVE_NODES.values())
+    for node in nodes:
+        node.refresh_peers()
+
+
+def config_snapshot() -> Dict[int, Tuple[str, int]]:
+    with _CONFIG_LOCK:
+        return dict(CONFIG)
 
 
 class ProcessNode:
     def __init__(self, pid: int):
-        if pid not in CONFIG:
-            raise ValueError(f"Unknown process id {pid}")
-        self.pid = pid
-        self.host, self.port = CONFIG[pid]
-        self.peers = {i: CONFIG[i] for i in CONFIG if i != pid}
+        with _CONFIG_LOCK:
+            if pid not in CONFIG:
+                raise ValueError(f"Unknown process id {pid}")
+            self.pid = pid
+            self.host, self.port = CONFIG[pid]
+            self.peers = {i: CONFIG[i] for i in CONFIG if i != pid}
+            _ACTIVE_NODES[pid] = self
 
         self.coordinator_id: Optional[int] = None
         self.last_heartbeat: float = 0.0
@@ -64,6 +102,8 @@ class ProcessNode:
                 self.server_socket.close()
             except OSError:
                 pass
+        with _CONFIG_LOCK:
+            _ACTIVE_NODES.pop(self.pid, None)
 
     # ---------- networking ----------
     def server_loop(self):
@@ -147,6 +187,15 @@ class ProcessNode:
 
     def lower_ids(self):
         return [i for i in CONFIG if i < self.pid]
+
+    def refresh_peers(self):
+        with _CONFIG_LOCK:
+            entry = CONFIG.get(self.pid)
+            peers = {i: CONFIG[i] for i in CONFIG if i != self.pid}
+        if entry is None:
+            return
+        self.host, self.port = entry
+        self.peers = peers
 
     # ---------- heartbeat + failure detection ----------
     def heartbeat_and_failure_detector_loop(self):

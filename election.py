@@ -2,15 +2,21 @@
 import os
 from typing import Optional
 
-from bully import BullyService, CONFIG
+from bully import BullyService, CONFIG, config_snapshot, update_peer_config
+from config import ELECTION_HOST, ELECTION_PORT
 
 # Read broker/process id from env
 BROKER_ID = int(os.getenv("BROKER_ID", "1"))
 
-if BROKER_ID not in CONFIG:
-    raise RuntimeError(f"BROKER_ID {BROKER_ID} not in CONFIG mapping.")
-
 _node: Optional[BullyService] = None
+
+
+def _ensure_self_membership() -> None:
+    if BROKER_ID in CONFIG:
+        return
+    peers = config_snapshot()
+    peers[BROKER_ID] = (ELECTION_HOST, ELECTION_PORT)
+    update_peer_config(peers)
 
 
 def start_election_service():

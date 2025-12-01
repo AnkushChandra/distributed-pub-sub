@@ -1,7 +1,8 @@
 from fastapi import APIRouter, HTTPException, Query
 
 import storage as st
-from schemas import ReplicateRequest
+from discovery_client import apply_discovery_update
+from schemas import DiscoveryUpdateRequest, ReplicateRequest
 
 
 def build_internal_router(*, owner_for_fn, broker_id: int) -> APIRouter:
@@ -39,5 +40,10 @@ def build_internal_router(*, owner_for_fn, broker_id: int) -> APIRouter:
             raise HTTPException(status_code=400, detail="invalid offset")
         st.replicate_record(topic, req.offset, req.key, req.value, req.headers)
         return {"status": "ok", "offset": req.offset}
+
+    @router.post("/internal/discovery/update")
+    async def discovery_update_endpoint(req: DiscoveryUpdateRequest):
+        apply_discovery_update(req.brokers)
+        return {"status": "ok", "brokers": len(req.brokers)}
 
     return router
