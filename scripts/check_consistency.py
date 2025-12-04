@@ -29,7 +29,7 @@ def _parse_brokers(raw: list[str]) -> Dict[int, str]:
     return mapping
 
 
-def _fetch_metadata(client: httpx.Client, base_url: str) -> Optional[dict]:
+def _fetch_metadata_from_broker(client: httpx.Client, base_url: str) -> Optional[dict]:
     try:
         resp = client.get(f"{base_url.rstrip('/')}/metadata", timeout=3.0)
         resp.raise_for_status()
@@ -37,6 +37,23 @@ def _fetch_metadata(client: httpx.Client, base_url: str) -> Optional[dict]:
     except Exception as exc:
         print(f"[WARN] failed to fetch metadata from {base_url}: {exc}", file=sys.stderr)
         return None
+
+
+def _fetch_metadata_with_failover(
+    client: httpx.Client, broker_map: Dict[int, str], preferred_base: str
+) -> Tuple[Optional[dict], str]:
+    """Try preferred broker first, then failover to others. Returns (metadata, base_used)."""
+    metadata = _fetch_metadata_from_broker(client, preferred_base)
+    if metadata is not None:
+        return metadata, preferred_base
+    for bid, base in broker_map.items():
+        if base == preferred_base:
+            continue
+        metadata = _fetch_metadata_from_broker(client, base)
+        if metadata is not None:
+            print(f"[INFO] switched metadata source to broker {bid} ({base})", file=sys.stderr)
+            return metadata, base
+    return None, preferred_base
 
 
 def _topic_entry(metadata: dict, topic: str) -> Optional[dict]:
@@ -96,8 +113,9 @@ def monitor_consistency(args: argparse.Namespace) -> None:
         iteration = 0
         while True:
             iteration += 1
-            metadata = _fetch_metadata(client, metadata_base)
+            metadata, metadata_base = _fetch_metadata_with_failover(client, broker_map, metadata_base)
             if metadata is None:
+                print(f"[WARN] all brokers unreachable for metadata", file=sys.stderr)
                 time.sleep(args.interval)
                 continue
             topic_info = _topic_entry(metadata, args.topic)

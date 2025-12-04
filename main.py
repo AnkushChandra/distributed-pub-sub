@@ -272,32 +272,47 @@ def _maybe_promote_topic_owner(topic: str) -> None:
     if owner_offset is not None:
         _topic_owner_offsets[topic] = owner_offset
         return
+    # Owner is unreachable - need to promote a follower
     followers = list(placement.get("followers", []))
+    if not followers:
+        return
+    # Try ISR members first, but fall back to any follower if ISR is empty/stale
     isr_members = [mid for mid in isr_for(topic, leader_view=True) if mid != owner_id]
-    if not isr_members:
+    candidates = isr_members if isr_members else [f for f in followers if f != owner_id]
+    if not candidates:
         return
     offsets = _topic_offsets_snapshot(topic)
     required = _topic_owner_offsets.get(topic, -1)
     current_max = max(offsets.values(), default=-1)
     target_offset = max(required, current_max)
-    for candidate in isr_members:
+    # Sort candidates by offset descending to pick the most caught-up one
+    candidate_offsets = []
+    for candidate in candidates:
         candidate_offset = offsets.get(candidate)
         if candidate_offset is None:
             candidate_offset = _fetch_topic_offset(candidate, topic)
-        if candidate_offset is None:
-            continue
-        if candidate_offset < target_offset:
-            continue
-        new_followers = [f for f in followers if f != candidate]
-        new_followers.append(owner_id)
-        set_topic_placement(topic, candidate, new_followers)
-        if candidate == BROKER_ID:
-            st.init_topic(topic)
-        print(
-            f"[P{BROKER_ID}] promoted topic={topic} owner -> P{candidate} "
-            f"(offset {candidate_offset}, target {target_offset})"
-        )
+        if candidate_offset is not None:
+            candidate_offsets.append((candidate, candidate_offset))
+    if not candidate_offsets:
         return
+    # Pick the candidate with highest offset
+    candidate_offsets.sort(key=lambda x: x[1], reverse=True)
+    best_candidate, best_offset = candidate_offsets[0]
+    if best_offset < target_offset:
+        # No candidate is caught up enough, but if owner is dead we must promote anyway
+        print(
+            f"[P{BROKER_ID}] WARNING: promoting topic={topic} owner -> P{best_candidate} "
+            f"with offset {best_offset} < target {target_offset} (data loss possible)"
+        )
+    new_followers = [f for f in followers if f != best_candidate]
+    new_followers.append(owner_id)
+    set_topic_placement(topic, best_candidate, new_followers)
+    if best_candidate == BROKER_ID:
+        st.init_topic(topic)
+    print(
+        f"[P{BROKER_ID}] promoted topic={topic} owner -> P{best_candidate} "
+        f"(offset {best_offset}, target {target_offset})"
+    )
 
 def _owner_api_base(owner_id: int) -> str:
     base = BROKER_API.get(int(owner_id))
@@ -509,6 +524,12 @@ app.include_router(
         isr_status_fn=_isr_status_snapshot,
     )
 )
+def _broker_api_base(broker_id_target: int) -> str:
+    base = BROKER_API.get(int(broker_id_target))
+    if base is None:
+        raise HTTPException(status_code=502, detail=f"Unknown broker {broker_id_target}")
+    return base
+
 app.include_router(
     build_client_router(
         broker_id=BROKER_ID,
@@ -519,6 +540,8 @@ app.include_router(
         poll_records_fn=st.poll_records,
         isr_members_fn=_isr_members,
         replicate_to_isr_fn=_replicate_to_isr,
+        followers_for_fn=followers_for,
+        broker_base_fn=_broker_api_base,
     )
 )
 app.include_router(

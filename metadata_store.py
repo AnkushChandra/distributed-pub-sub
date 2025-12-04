@@ -133,6 +133,11 @@ def owner_for(topic: str) -> Optional[int]:
         return None
 
 
+def topic_exists(topic: str, *, leader_view: bool = False) -> bool:
+    src = TOPIC_PLACEMENTS if leader_view else placement_source()
+    return topic in src
+
+
 def followers_for(topic: str, *, leader_view: bool = False) -> List[int]:
     src = TOPIC_PLACEMENTS if leader_view else placement_source()
     placement = src.get(topic)

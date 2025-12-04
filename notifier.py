@@ -26,7 +26,7 @@ class TopicNotifier:
 
 
 _notifiers: Dict[str, TopicNotifier] = {}
-_group_leases: Dict[Tuple[str, str], float] = {}
+_group_leases: Dict[Tuple[str, str], Tuple[str, float]] = {}
 
 
 def _prune_expired_leases(now: Optional[float] = None) -> None:
@@ -34,7 +34,7 @@ def _prune_expired_leases(now: Optional[float] = None) -> None:
         return
     if now is None:
         now = time.time()
-    expired = [key for key, expiry in _group_leases.items() if expiry <= now]
+    expired = [key for key, (_, expiry) in _group_leases.items() if expiry <= now]
     for key in expired:
         _group_leases.pop(key, None)
 
@@ -46,15 +46,17 @@ def get_notifier(topic: str) -> TopicNotifier:
     return _notifiers[topic]
 
 
-def enforce_group_singleton(topic: str, group_id: Optional[str]) -> None:
+def enforce_group_singleton(topic: str, group_id: Optional[str], consumer_id: Optional[str] = None) -> None:
     if not group_id:
         return
     now = time.time()
     _prune_expired_leases(now)
     key = (topic, group_id)
-    if _group_leases.get(key, 0.0) > now:
+    identity = consumer_id or f"anon:{topic}:{group_id}"
+    holder, expiry = _group_leases.get(key, (None, 0.0))
+    if holder is not None and holder != identity and expiry > now:
         raise ValueError("Group already has an active consumer")
-    _group_leases[key] = now + LEASE_TTL_SEC
+    _group_leases[key] = (identity, now + LEASE_TTL_SEC)
 
 
 def committed(topic: str, consumer_id: Optional[str], group_id: Optional[str]) -> int:
@@ -64,9 +66,10 @@ def committed(topic: str, consumer_id: Optional[str], group_id: Optional[str]) -
 def commit(topic: str, consumer_id: Optional[str], group_id: Optional[str], offset: int) -> None:
     st.set_commit(topic, consumer_id, group_id, offset)
     if group_id:
-        _group_leases[(topic, group_id)] = time.time() + LEASE_TTL_SEC
+        identity = consumer_id or f"anon:{topic}:{group_id}"
+        _group_leases[(topic, group_id)] = (identity, time.time() + LEASE_TTL_SEC)
 
 
 def leases_snapshot() -> Dict[str, float]:
     _prune_expired_leases()
-    return {f"{topic}|{group}": exp for (topic, group), exp in _group_leases.items()}
+    return {f"{topic}|{group}": expiry for (topic, group), (_, expiry) in _group_leases.items()}

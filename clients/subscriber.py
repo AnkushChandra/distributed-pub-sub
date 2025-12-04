@@ -27,8 +27,8 @@ def parse_args() -> argparse.Namespace:
         "--brokers",
         help="Comma-separated list of broker base URLs for failover (overrides --broker)",
     )
-    parser.add_argument("--group-id", help="Consumer group id (mutually exclusive with --consumer-id)")
-    parser.add_argument("--consumer-id", help="Standalone consumer id if not using groups")
+    parser.add_argument("--group-id", help="Consumer group id (auto-assigns consumer id if omitted)")
+    parser.add_argument("--consumer-id", help="Explicit consumer id (overrides auto-assignment)")
     parser.add_argument(
         "--from-offset",
         type=int,
@@ -56,14 +56,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log a heartbeat when polls return no data",
     )
+    parser.add_argument(
+        "--prefer-replica",
+        type=int,
+        default=None,
+        help="Broker ID to prefer for reading (forces routing to specific replica)",
+    )
     return parser.parse_args()
 
 
 def ensure_identity(args: argparse.Namespace) -> tuple[Optional[str], Optional[str]]:
     group_id = args.group_id
     consumer_id = args.consumer_id
-    if group_id and consumer_id:
-        raise SystemExit("--group-id and --consumer-id are mutually exclusive")
+    if group_id and not consumer_id:
+        consumer_id = f"grp-{group_id}-{os.getpid()}-{int(time.time()*1000)}"
     if not group_id and not consumer_id:
         consumer_id = f"cli-{os.getpid()}"
     return consumer_id, group_id
@@ -96,19 +102,20 @@ def maybe_commit(
     if group_id:
         payload["group_id"] = group_id
     try:
-        resp = client.post(f"{base}/commit", json=payload)
+        resp = client.post(f"{base}/commit", json=payload, timeout=2.0)
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         print(f"[WARN] commit failed: {exc}", file=sys.stderr)
 
 
-def format_record(rec: Dict[str, Any]) -> str:
+def format_record(rec: Dict[str, Any], replica_id: Optional[int] = None) -> str:
     ts_ms = rec.get("ts_ms")
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_ms / 1000.0)) if ts_ms else "-"
     key = rec.get("key")
     value = rec.get("value")
     headers = rec.get("headers") or {}
-    return f"[{ts}] offset={rec.get('offset')} key={key!r} headers={headers} value={value}"
+    replica_str = f" [replica={replica_id}]" if replica_id is not None else ""
+    return f"[{ts}] offset={rec.get('offset')} key={key!r} headers={headers} value={value}{replica_str}"
 
 
 def main() -> None:
@@ -129,6 +136,8 @@ def main() -> None:
         params["group_id"] = group_id
     if args.from_offset is not None:
         params["from_offset"] = max(0, args.from_offset)
+    if args.prefer_replica is not None:
+        params["prefer_replica"] = args.prefer_replica
 
     def current_base() -> str:
         return broker_pool[broker_idx]
@@ -137,9 +146,10 @@ def main() -> None:
         nonlocal broker_idx
         broker_idx = (broker_idx + 1) % len(broker_pool)
 
+    replica_info = f" prefer_replica={args.prefer_replica}" if args.prefer_replica else ""
     print(
         f"[info] consuming topic='{args.topic}' via {current_base()} (pool={broker_pool}) as "
-        f"group={group_id or '-'} consumer={consumer_id or '-'}",
+        f"group={group_id or '-'} consumer={consumer_id or '-'}{replica_info}",
         file=sys.stderr,
     )
 
@@ -166,9 +176,10 @@ def main() -> None:
 
             body = resp.json()
             records = body.get("records", [])
+            replica_id = body.get("replica_id")
             if records:
                 for rec in records:
-                    print(format_record(rec), flush=True)
+                    print(format_record(rec, replica_id), flush=True)
                 last_offset = records[-1]["offset"]
                 if not args.no_commit:
                     maybe_commit(client, base, args.topic, last_offset, consumer_id, group_id)
@@ -180,7 +191,7 @@ def main() -> None:
                 if args.show_idle:
                     committed = body.get("committed")
                     print(
-                        f"[idle] no records; committed={committed} next_offset={body.get('next_offset')}",
+                        f"[idle] no records; committed={committed} next_offset={body.get('next_offset')} replica={replica_id}",
                         file=sys.stderr,
                     )
     except KeyboardInterrupt:

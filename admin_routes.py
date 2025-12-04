@@ -14,6 +14,7 @@ from metadata_store import (
     metadata_snapshot,
     set_topic_owner,
     set_topic_placement,
+    topic_exists,
 )
 from schemas import GossipPushPullRequest
 
@@ -90,6 +91,12 @@ def build_admin_router(
         if owner_id not in BROKER_API:
             raise HTTPException(status_code=400, detail=f"Unknown owner_id {owner_id}")
 
+        if topic_exists(name, leader_view=True):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "TOPIC_EXISTS", "topic": name},
+            )
+
         followers = select_followers_fn(int(owner_id), rf)
         set_topic_placement(name, int(owner_id), followers)
         if owner_id == BROKER_ID:
@@ -99,6 +106,95 @@ def build_admin_router(
             "topic": name,
             "owner_id": owner_id,
             "leader_id": get_leader_id(),
+        }
+
+    @router.post("/admin/topics/{topic}/replicas")
+    async def add_replica(topic: str, broker_id_to_add: int):
+        """Add a replica to an existing topic."""
+        if not is_cluster_leader():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "NOT_LEADER", "leader_id": get_leader_id()},
+            )
+        if not topic_exists(topic, leader_view=True):
+            raise HTTPException(status_code=404, detail=f"Topic '{topic}' not found")
+        if broker_id_to_add not in BROKER_API:
+            raise HTTPException(status_code=400, detail=f"Unknown broker_id {broker_id_to_add}")
+        
+        meta = metadata_snapshot()
+        placement = meta.get("topics", {}).get(topic, {})
+        owner = placement.get("owner")
+        followers = list(placement.get("followers", []))
+        
+        if broker_id_to_add == owner:
+            raise HTTPException(status_code=400, detail=f"Broker {broker_id_to_add} is already the owner")
+        if broker_id_to_add in followers:
+            raise HTTPException(status_code=400, detail=f"Broker {broker_id_to_add} is already a replica")
+        
+        followers.append(broker_id_to_add)
+        set_topic_placement(topic, owner, followers)
+        
+        return {
+            "status": "ok",
+            "topic": topic,
+            "owner": owner,
+            "followers": followers,
+            "replica_count": len(followers) + 1,
+        }
+
+    @router.delete("/admin/topics/{topic}/replicas/{broker_id_to_remove}")
+    async def remove_replica(topic: str, broker_id_to_remove: int):
+        """Remove a replica from a topic."""
+        if not is_cluster_leader():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "NOT_LEADER", "leader_id": get_leader_id()},
+            )
+        if not topic_exists(topic, leader_view=True):
+            raise HTTPException(status_code=404, detail=f"Topic '{topic}' not found")
+        
+        meta = metadata_snapshot()
+        placement = meta.get("topics", {}).get(topic, {})
+        owner = placement.get("owner")
+        followers = list(placement.get("followers", []))
+        
+        if broker_id_to_remove == owner:
+            raise HTTPException(status_code=400, detail="Cannot remove the owner. Reassign ownership first.")
+        if broker_id_to_remove not in followers:
+            raise HTTPException(status_code=400, detail=f"Broker {broker_id_to_remove} is not a replica")
+        
+        followers.remove(broker_id_to_remove)
+        set_topic_placement(topic, owner, followers)
+        
+        return {
+            "status": "ok",
+            "topic": topic,
+            "owner": owner,
+            "followers": followers,
+            "replica_count": len(followers) + 1,
+        }
+
+    @router.get("/admin/topics/{topic}")
+    async def get_topic_info(topic: str):
+        """Get detailed info about a topic."""
+        if not is_cluster_leader():
+            await refresh_owner_cache_fn(force=True)
+        if not topic_exists(topic, leader_view=is_cluster_leader()):
+            raise HTTPException(status_code=404, detail=f"Topic '{topic}' not found")
+        
+        meta = metadata_snapshot()
+        placement = meta.get("topics", {}).get(topic, {})
+        owner = placement.get("owner")
+        followers = placement.get("followers", [])
+        isr = placement.get("isr", [])
+        
+        return {
+            "topic": topic,
+            "owner": owner,
+            "followers": followers,
+            "isr": isr,
+            "replica_count": len(followers) + 1,
+            "alive_brokers": alive_brokers_fn(),
         }
 
     @router.post("/_gossip/pushpull")
