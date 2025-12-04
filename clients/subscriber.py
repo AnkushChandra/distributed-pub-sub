@@ -21,7 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--broker",
         default=DEFAULT_BROKER,
-        help="Base URL of the broker API (default: %(default)s)",
+        help="Primary broker base URL (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--brokers",
+        help="Comma-separated list of broker base URLs for failover (overrides --broker)",
     )
     parser.add_argument("--group-id", help="Consumer group id (mutually exclusive with --consumer-id)")
     parser.add_argument("--consumer-id", help="Standalone consumer id if not using groups")
@@ -65,6 +69,19 @@ def ensure_identity(args: argparse.Namespace) -> tuple[Optional[str], Optional[s
     return consumer_id, group_id
 
 
+def parse_broker_pool(args: argparse.Namespace) -> list[str]:
+    if args.brokers:
+        parts = [p.strip().rstrip('/') for p in args.brokers.split(',')]
+        pool = [p for p in parts if p]
+        if not pool:
+            raise SystemExit("--brokers provided but no valid URLs parsed")
+        return pool
+    base = (args.broker or DEFAULT_BROKER).strip()
+    if not base:
+        raise SystemExit("No broker URL provided")
+    return [base.rstrip('/')]
+
+
 def maybe_commit(
     client: httpx.Client,
     base: str,
@@ -97,7 +114,8 @@ def format_record(rec: Dict[str, Any]) -> str:
 def main() -> None:
     args = parse_args()
     consumer_id, group_id = ensure_identity(args)
-    base = args.broker.rstrip("/")
+    broker_pool = parse_broker_pool(args)
+    broker_idx = 0
 
     client = httpx.Client(timeout=None)
     params: Dict[str, Any] = {
@@ -112,22 +130,38 @@ def main() -> None:
     if args.from_offset is not None:
         params["from_offset"] = max(0, args.from_offset)
 
-    poll_url = f"{base}/poll"
+    def current_base() -> str:
+        return broker_pool[broker_idx]
+
+    def rotate_base() -> None:
+        nonlocal broker_idx
+        broker_idx = (broker_idx + 1) % len(broker_pool)
 
     print(
-        f"[info] consuming topic='{args.topic}' via {base} as "
+        f"[info] consuming topic='{args.topic}' via {current_base()} (pool={broker_pool}) as "
         f"group={group_id or '-'} consumer={consumer_id or '-'}",
         file=sys.stderr,
     )
 
     try:
+        consecutive_failovers = 0
         while True:
+            base = current_base()
+            poll_url = f"{base}/poll"
             try:
                 resp = client.get(poll_url, params=params)
                 resp.raise_for_status()
+                consecutive_failovers = 0
             except httpx.HTTPError as exc:
-                print(f"[ERROR] poll failed: {exc}; retrying in 1s", file=sys.stderr)
-                time.sleep(1.0)
+                print(
+                    f"[WARN] poll failed against {base}: {exc}; switching brokers",
+                    file=sys.stderr,
+                )
+                rotate_base()
+                consecutive_failovers += 1
+                if consecutive_failovers >= len(broker_pool):
+                    time.sleep(1.0)
+                    consecutive_failovers = 0
                 continue
 
             body = resp.json()

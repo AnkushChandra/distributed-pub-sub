@@ -13,6 +13,7 @@ h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 idna==3.11
+cryptography==43.0.1
 multidict==6.7.0
 propcache==0.4.1
 psutil==7.1.3

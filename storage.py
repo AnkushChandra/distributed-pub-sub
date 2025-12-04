@@ -3,6 +3,8 @@ from __future__ import annotations
 import json, os, sqlite3, threading, time, pathlib
 from typing import Any, Dict, List, Optional, Tuple
 
+from cryptography.fernet import Fernet, InvalidToken
+
 from config import BROKER_ID
 
 _data_dir_env = os.getenv("PUBSUB_DATA_DIR")
@@ -10,6 +12,25 @@ _data_dir_default = f"data{BROKER_ID}" if BROKER_ID is not None else "data"
 DATA_DIR = pathlib.Path(_data_dir_env or _data_dir_default).resolve()
 DB_PATH = DATA_DIR / "pubsub.sqlite"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+_ENC_PREFIX = "ENC::FERNET::"
+
+
+def _init_encryptor() -> Optional[Fernet]:
+    key = os.getenv("PUBSUB_STORAGE_KEY") or os.getenv("STORAGE_ENCRYPTION_KEY")
+    if not key:
+        return None
+    normalized = key.strip().encode()
+    try:
+        return Fernet(normalized)
+    except Exception as exc:  # pragma: no cover - configuration error
+        raise RuntimeError(
+            "Invalid PUBSUB_STORAGE_KEY/STORAGE_ENCRYPTION_KEY provided. "
+            "Use cryptography.Fernet.generate_key()."
+        ) from exc
+
+
+_ENCRYPTOR: Optional[Fernet] = _init_encryptor()
 
 _lock = threading.RLock()
 
@@ -48,6 +69,36 @@ def _connect() -> sqlite3.Connection:
 
 _conn = _connect()
 
+
+def _encrypt_blob(raw: str) -> str:
+    if not _ENCRYPTOR:
+        return raw
+    token = _ENCRYPTOR.encrypt(raw.encode("utf-8"))
+    return f"{_ENC_PREFIX}{token.decode('ascii')}"
+
+
+def _decrypt_blob(raw: str) -> str:
+    if not raw.startswith(_ENC_PREFIX):
+        return raw
+    if not _ENCRYPTOR:
+        raise RuntimeError(
+            "Encrypted payload encountered but no PUBSUB_STORAGE_KEY configured"
+        )
+    token = raw[len(_ENC_PREFIX):].encode("ascii")
+    try:
+        decrypted = _ENCRYPTOR.decrypt(token)
+    except InvalidToken as exc:
+        raise RuntimeError("Failed to decrypt storage payload") from exc
+    return decrypted.decode("utf-8")
+
+
+def _serialize(value: Any) -> str:
+    return _encrypt_blob(json.dumps(value, separators=(",", ":")))
+
+
+def _deserialize(blob: str) -> Any:
+    return json.loads(_decrypt_blob(blob))
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -60,8 +111,8 @@ def init_topic(topic: str) -> None:
 
 def append_record(topic: str, key: Optional[str], value: Any, headers: Dict[str, Any]) -> int:
     """Atomically reserve the next per-topic offset and append a row."""
-    payload = json.dumps(value, separators=(",", ":"))
-    hjson   = json.dumps(headers or {}, separators=(",", ":"))
+    payload = _serialize(value)
+    hjson   = _serialize(headers or {})
     ts = _now_ms()
     with _lock:
         _conn.execute("BEGIN IMMEDIATE;")  # get a write lock early
@@ -94,8 +145,8 @@ def poll_records(topic: str, start_offset: int, max_records: int) -> List[Dict[s
             "offset": int(off),
             "ts_ms": int(ts),
             "key": key,
-            "value": json.loads(vj),
-            "headers": json.loads(hj),
+            "value": _deserialize(vj),
+            "headers": _deserialize(hj),
         })
     return out
 
@@ -167,8 +218,8 @@ def latest_offset(topic: str) -> int:
 
 def replicate_record(topic: str, offset: int, key: Optional[str], value: Any, headers: Dict[str, Any]) -> None:
     """Insert a record with an explicit offset (used by followers)."""
-    payload = json.dumps(value, separators=(",", ":"))
-    hjson = json.dumps(headers or {}, separators=(",", ":"))
+    payload = _serialize(value)
+    hjson = _serialize(headers or {})
     ts = _now_ms()
     with _lock:
         _conn.execute("BEGIN IMMEDIATE;")
