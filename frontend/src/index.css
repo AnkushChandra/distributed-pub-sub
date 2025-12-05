@@ -1,0 +1,33 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  background: #0a0a0f;
+  min-height: 100vh;
+  color: #e4e4e7;
+}
+
+:root {
+  --bg-primary: #0a0a0f;
+  --bg-card: #111118;
+  --bg-card-hover: #18181f;
+  --bg-elevated: #1c1c24;
+  --border-color: #27272a;
+  --border-light: #3f3f46;
+  --accent-primary: #3b82f6;
+  --accent-success: #22c55e;
+  --accent-error: #ef4444;
+  --accent-warning: #f59e0b;
+  --accent-info: #06b6d4;
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', monospace;
+}

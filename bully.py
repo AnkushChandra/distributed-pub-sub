@@ -76,6 +76,26 @@ class ProcessNode:
 
         self.running: bool = False
         self.server_socket: Optional[socket.socket] = None
+        
+        # Metrics tracking
+        self.metrics_lock = threading.Lock()
+        self.metrics = {
+            "elections_started": 0,
+            "elections_won": 0,
+            "election_messages_sent": 0,
+            "election_messages_received": 0,
+            "heartbeats_sent": 0,
+            "heartbeats_received": 0,
+            "last_election_duration_ms": 0,
+            "last_election_start": 0,
+            "coordinator_changes": 0,
+            "failures_detected": 0,
+            # Propagation tracking
+            "total_election_rounds": 0,
+            "completed_elections": 0,
+            "last_election_rounds": 0,
+            "total_nodes_notified": 0,
+        }
 
     # ---------- lifecycle ----------
     def start(self):
@@ -219,12 +239,16 @@ class ProcessNode:
             self.last_heartbeat = now
         for pid in self.peers:
             self.send_message(pid, {"type": "HEARTBEAT"})
+        with self.metrics_lock:
+            self.metrics["heartbeats_sent"] += len(self.peers)
 
     def on_heartbeat(self, src_pid: int):
         with self.state_lock:
             if self.coordinator_id is None or self.coordinator_id == src_pid:
                 self.coordinator_id = src_pid
                 self.last_heartbeat = time.time()
+        with self.metrics_lock:
+            self.metrics["heartbeats_received"] += 1
 
     def on_coordinator_failure(self):
         with self.state_lock:
@@ -232,6 +256,8 @@ class ProcessNode:
                 return
             print(f"[P{self.pid}] detected coordinator failure")
             self.coordinator_id = None
+        with self.metrics_lock:
+            self.metrics["failures_detected"] += 1
         self.detect_coordinator_failure()
 
     # ---------- election ----------
@@ -249,10 +275,16 @@ class ProcessNode:
             self.in_election = True
             self.ok_event.clear()
             self.coord_event.clear()
+            self._election_round = 1  # Track rounds for this election
+        with self.metrics_lock:
+            self.metrics["elections_started"] += 1
+            self.metrics["last_election_start"] = time.time()
         higher = self.higher_ids()
         print(f"[P{self.pid}] starting election, higher={higher}")
         for pid in higher:
             self.send_message(pid, {"type": "ELECTION"})
+        with self.metrics_lock:
+            self.metrics["election_messages_sent"] += len(higher)
         if not higher:
             self.become_coordinator()
             return
@@ -271,10 +303,17 @@ class ProcessNode:
     def on_election(self, from_pid: int):
         if from_pid is None:
             return
+        with self.metrics_lock:
+            self.metrics["election_messages_received"] += 1
         if self.pid > from_pid:
             self.send_message(from_pid, {"type": "OK"})
+            with self.metrics_lock:
+                self.metrics["election_messages_sent"] += 1
             with self.state_lock:
                 already = self.in_election
+                # Increment round when we receive and forward election
+                if hasattr(self, '_election_round'):
+                    self._election_round += 1
             if not already:
                 t = threading.Thread(target=self.run_election, daemon=True)
                 t.start()
@@ -287,15 +326,33 @@ class ProcessNode:
             self.coordinator_id = self.pid
             self.in_election = False
             self.last_heartbeat = time.time()
-        print(f"[P{self.pid}] became coordinator")
-        for pid in self.lower_ids():
+            election_rounds = getattr(self, '_election_round', 1)
+        lower = self.lower_ids()
+        # Total rounds = election rounds + 1 (for COORDINATOR broadcast)
+        total_rounds = election_rounds + 1
+        with self.metrics_lock:
+            self.metrics["elections_won"] += 1
+            if self.metrics["last_election_start"] > 0:
+                self.metrics["last_election_duration_ms"] = (time.time() - self.metrics["last_election_start"]) * 1000
+            self.metrics["coordinator_changes"] += 1
+            self.metrics["last_election_rounds"] = total_rounds
+            self.metrics["total_election_rounds"] += total_rounds
+            self.metrics["completed_elections"] += 1
+            self.metrics["total_nodes_notified"] += len(lower)
+        print(f"[P{self.pid}] became coordinator (rounds={total_rounds})")
+        for pid in lower:
             self.send_message(pid, {"type": "COORDINATOR", "leader": self.pid})
+        with self.metrics_lock:
+            self.metrics["election_messages_sent"] += len(lower)
 
     def on_coordinator(self, leader_id: int):
         with self.state_lock:
             self.coordinator_id = leader_id
             self.in_election = False
             self.last_heartbeat = time.time()
+        with self.metrics_lock:
+            self.metrics["election_messages_received"] += 1
+            self.metrics["coordinator_changes"] += 1
         self.coord_event.set()
 
     # ---------- startup ----------
@@ -325,3 +382,7 @@ class BullyService(ProcessNode):
     def current_leader(self) -> Optional[int]:
         with self.state_lock:
             return self.coordinator_id
+
+    def get_metrics(self) -> dict:
+        with self.metrics_lock:
+            return dict(self.metrics)

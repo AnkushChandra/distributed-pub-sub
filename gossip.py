@@ -34,6 +34,26 @@ class GossipState:
         self.fanout = 3
         self.suspect_after = 2.0
         self.dead_after = 4.0
+        
+        # Metrics
+        self.metrics = {
+            "rounds": 0,
+            "messages_sent": 0,
+            "messages_received": 0,
+            "members_discovered": 0,
+            "status_changes": 0,
+            "merges_applied": 0,
+            "start_time": time.time(),
+            # Propagation tracking - tracks rounds to reach all nodes
+            "propagation_tests": 0,
+            "total_propagation_rounds": 0,
+            "last_propagation_rounds": 0,
+            "avg_propagation_rounds": 0.0,
+        }
+        # Track active propagation test
+        self._active_test: Dict[str, Any] = {}
+        # Track incarnations we've seen from each node
+        self._seen_incarnations: Dict[str, int] = {}
 
     def upsert_member(self, rec: Dict[str, Any]) -> None:
         mid = rec["node_id"]
@@ -49,6 +69,10 @@ class GossipState:
         )
 
         if newer:
+            if old is None:
+                self.metrics["members_discovered"] += 1
+            elif old.status != rec["status"]:
+                self.metrics["status_changes"] += 1
             self.members[mid] = Member(
                 mid,
                 rec["addr"],
@@ -56,6 +80,72 @@ class GossipState:
                 rec["incarnation"],
                 _now(),
             )
+            self.metrics["merges_applied"] += 1
+            
+            # Track when we first see a new incarnation from another node
+            # This helps measure propagation - when did info about node X reach us?
+            prev_inc = self._seen_incarnations.get(mid, 0)
+            if rec["incarnation"] > prev_inc:
+                self._seen_incarnations[mid] = rec["incarnation"]
+                # If there's an active test from this origin, mark that we received it
+                if self._active_test.get("origin") == mid and self._active_test.get("incarnation") == rec["incarnation"]:
+                    if "received_round" not in self._active_test:
+                        self._active_test["received_round"] = self.metrics["rounds"]
+    
+    def start_propagation_test(self) -> int:
+        """Bump own incarnation to test propagation speed."""
+        me = self.members[self.self_id]
+        me.incarnation += 1
+        self._active_test = {
+            "start_round": self.metrics["rounds"],
+            "origin": self.self_id,
+            "incarnation": me.incarnation,
+            "nodes_confirmed": {self.self_id},  # We already have our own info
+        }
+        return me.incarnation
+    
+    def record_propagation_ack(self, from_node: str, their_view: List[Dict[str, Any]]) -> None:
+        """Check if a remote node has our latest incarnation (confirms propagation)."""
+        if not self._active_test or self._active_test.get("completed"):
+            return
+        
+        my_id = self.self_id
+        my_inc = self._active_test.get("incarnation", 0)
+        
+        # Check if the remote node's view includes our latest incarnation
+        for entry in their_view:
+            if entry.get("node_id") == my_id and entry.get("incarnation", 0) >= my_inc:
+                self._active_test.setdefault("nodes_confirmed", set()).add(from_node)
+                break
+    
+    def check_propagation_complete(self) -> None:
+        """Check if propagation test has completed (all nodes have our info)."""
+        if not self._active_test or self._active_test.get("completed"):
+            return
+        
+        current_round = self.metrics["rounds"]
+        start_round = self._active_test.get("start_round", current_round)
+        
+        # Get all alive nodes
+        alive_nodes = {m.node_id for m in self.members.values() if m.status == "alive"}
+        confirmed = self._active_test.get("nodes_confirmed", set())
+        
+        # Check if all alive nodes have confirmed
+        all_confirmed = alive_nodes <= confirmed
+        timed_out = (current_round - start_round) >= 10  # Timeout after 10 rounds
+        
+        if all_confirmed or timed_out:
+            rounds_taken = current_round - start_round
+            if all_confirmed:
+                # Only count successful propagations
+                self.metrics["propagation_tests"] += 1
+                self.metrics["total_propagation_rounds"] += rounds_taken
+                self.metrics["last_propagation_rounds"] = rounds_taken
+                if self.metrics["propagation_tests"] > 0:
+                    self.metrics["avg_propagation_rounds"] = round(
+                        self.metrics["total_propagation_rounds"] / self.metrics["propagation_tests"], 2
+                    )
+            self._active_test["completed"] = True
 
     def touch_self(self) -> None:
         me = self.members[self.self_id]
@@ -130,6 +220,7 @@ class GossipService:
         self._stop.set()
 
     async def _loop(self) -> None:
+        test_interval = 20  # Run propagation test every N rounds
         while not self._stop.is_set():
             await asyncio.sleep(self.state.interval_sec)
             self.state.touch_self()
@@ -137,6 +228,16 @@ class GossipService:
             peers = self.state.pick_peers(self.state.fanout)
             if not peers:
                 continue
+            self.state.metrics["rounds"] += 1
+            self.state.metrics["messages_sent"] += len(peers)
+            
+            # Periodically start propagation test
+            if self.state.metrics["rounds"] % test_interval == 0:
+                self.state.start_propagation_test()
+            
+            # Check for completed propagation tests
+            self.state.check_propagation_complete()
+            
             await asyncio.gather(
                 *(self._pushpull(p) for p in peers),
                 return_exceptions=True,
@@ -166,6 +267,13 @@ class GossipService:
 
     def _apply_pushpull(self, data: Dict[str, Any]) -> None:
         remote = data.get("membership", [])
+        self.state.metrics["messages_received"] += 1
+        
+        # Check if remote node has our latest info (for propagation tracking)
+        from_id = data.get("from_id")
+        if from_id and remote:
+            self.state.record_propagation_ack(from_id, remote)
+        
         self.state.merge_remote_view(remote)
         if self._on_payload_fn:
             try:

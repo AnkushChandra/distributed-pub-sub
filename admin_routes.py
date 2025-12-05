@@ -201,20 +201,16 @@ def build_admin_router(
     async def gossip_pushpull(req: GossipPushPullRequest):
         state = get_gossip_state()
         if state is not None:
+            # Record that sender has info about us (for propagation tracking)
+            if req.membership:
+                state.record_propagation_ack(req.from_id, req.membership)
             state.merge_remote_view(req.membership)
         maybe_update_metadata_from_remote(req.metadata)
         membership = state.serialize_view() if state else []
         return {
+            "from_id": state.self_id if state else None,
             "membership": membership,
             "metadata": metadata_snapshot(),
         }
 
     return router
-
-
-def _select_followers(owner_id: int, replication_factor: int, alive_fn) -> list[int]:
-    desired = max(0, replication_factor - 1)
-    candidates = [bid for bid in alive_fn() if bid != owner_id]
-    if len(candidates) <= desired:
-        return sorted(candidates)
-    return sorted(random.sample(candidates, desired))

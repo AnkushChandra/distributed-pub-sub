@@ -14,6 +14,25 @@ _BROKER_API: Dict[int, str] = {}
 _get_snapshot: Optional[Callable[[], PlacementSnapshot]] = None
 _refresh_fn: Optional[Callable[[], Awaitable[None]]] = None
 
+# Metrics tracking
+_metrics = {
+    "push_attempts": 0,
+    "push_success": 0,
+    "push_failed": 0,
+    "pull_attempts": 0,
+    "pull_success": 0,
+    "pull_failed": 0,
+    "records_pushed": 0,
+    "records_pulled": 0,
+    "total_push_latency_ms": 0,
+    "total_pull_latency_ms": 0,
+}
+_metrics_lock = asyncio.Lock()
+
+
+def get_replication_metrics() -> dict:
+    return dict(_metrics)
+
 
 def _set_broker_api(peers: Dict[int, str]) -> None:
     global _BROKER_API
@@ -48,7 +67,8 @@ async def replicate_to_followers(
     follower_ids: Iterable[int],
     timeout: float = 3.0,
 ) -> Dict[int, bool]:
-    """Push a record to the given followers and return ack status per follower."""
+    """Push a record to the given followers IN PARALLEL and return ack status per follower."""
+    import time
     results: Dict[int, bool] = {}
     ids = [int(fid) for fid in follower_ids if fid is not None and int(fid) != _BROKER_ID]
     if not ids:
@@ -59,20 +79,38 @@ async def replicate_to_followers(
         "value": value,
         "headers": headers or {},
     }
+    
+    async def push_to_follower(fid: int, client: httpx.AsyncClient) -> tuple:
+        base = _BROKER_API.get(fid)
+        if not base:
+            _metrics["push_failed"] += 1
+            return (fid, False)
+        url = f"{base}/internal/topics/{topic}/replicate"
+        _metrics["push_attempts"] += 1
+        start = time.time()
+        try:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            _metrics["push_success"] += 1
+            _metrics["records_pushed"] += 1
+            _metrics["total_push_latency_ms"] += (time.time() - start) * 1000
+            return (fid, True)
+        except Exception as exc:
+            print(f"[Broker {_BROKER_ID}] replicate push to P{fid} failed: {exc}")
+            _metrics["push_failed"] += 1
+            return (fid, False)
+    
+    # Push to all followers in parallel
     async with httpx.AsyncClient(timeout=timeout) as client:
-        for fid in ids:
-            base = _BROKER_API.get(fid)
-            if not base:
-                results[fid] = False
-                continue
-            url = f"{base}/internal/topics/{topic}/replicate"
-            try:
-                resp = await client.post(url, json=payload)
-                resp.raise_for_status()
-                results[fid] = True
-            except Exception as exc:
-                print(f"[Broker {_BROKER_ID}] replicate push to P{fid} failed: {exc}")
-                results[fid] = False
+        tasks = [push_to_follower(fid, client) for fid in ids]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        for resp in responses:
+            if isinstance(resp, tuple):
+                fid, success = resp
+                results[fid] = success
+            elif isinstance(resp, Exception):
+                print(f"[Broker {_BROKER_ID}] replicate task error: {resp}")
+    
     return results
 
 
@@ -121,6 +159,9 @@ async def follower_replication_loop(
                     continue
                 local_last = storage.latest_offset(topic)
                 fetch_offset = max(0, local_last + 1)
+                import time as _time
+                _metrics["pull_attempts"] += 1
+                pull_start = _time.time()
                 try:
                     async with httpx.AsyncClient(timeout=3.0) as client:
                         resp = await client.get(
@@ -138,10 +179,15 @@ async def follower_replication_loop(
                             continue
                         resp.raise_for_status()
                         data = resp.json()
+                        _metrics["pull_success"] += 1
+                        _metrics["total_pull_latency_ms"] += (_time.time() - pull_start) * 1000
                 except Exception as e:
                     print(f"[Broker {_BROKER_ID}] replication fetch failed: {e}")
+                    _metrics["pull_failed"] += 1
                     continue
-                for rec in data.get("records", []):
+                records = data.get("records", [])
+                _metrics["records_pulled"] += len(records)
+                for rec in records:
                     try:
                         off = int(rec["offset"])
                     except (KeyError, TypeError, ValueError):

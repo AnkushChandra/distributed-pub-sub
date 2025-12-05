@@ -28,57 +28,34 @@ _promote_topic_fn: Optional[PromoteTopicFn] = None
 _sync_isr_fn: Optional[SyncIsrFn] = None
 
 _configured: bool = False
-
 _gossip_state: Optional[gossip.GossipState] = None
 _gossip_service: Optional[gossip.GossipService] = None
 _gossip_http: Optional[aiohttp.ClientSession] = None
-_replication_task: Optional[asyncio.Task] = None
-_metadata_sync_task: Optional[asyncio.Task] = None
-_failover_task: Optional[asyncio.Task] = None
-_isr_task: Optional[asyncio.Task] = None
-_leader_watch_task: Optional[asyncio.Task] = None
+_tasks: Dict[str, asyncio.Task] = {}
 
 
 def configure_lifecycle(
-    *,
-    broker_id: int,
-    broker_api: Dict[int, str],
-    peer_map_fn: Callable[[], Dict[str, str]],
-    self_api_base_fn: Callable[[], str],
-    gossip_payload_fn: GossipPayloadFn,
-    handle_gossip_payload_fn: GossipHandlerFn,
-    placement_getter: Callable[[], Dict[str, Any]],
-    refresh_owner_cache_fn: AsyncCallable,
-    is_leader_fn: Callable[[], bool],
-    topics_provider_fn: TopicsProviderFn,
-    promote_topic_fn: PromoteTopicFn,
-    sync_isr_fn: SyncIsrFn,
+    *, broker_id: int, broker_api: Dict[int, str],
+    peer_map_fn: Callable[[], Dict[str, str]], self_api_base_fn: Callable[[], str],
+    gossip_payload_fn: GossipPayloadFn, handle_gossip_payload_fn: GossipHandlerFn,
+    placement_getter: Callable[[], Dict[str, Any]], refresh_owner_cache_fn: AsyncCallable,
+    is_leader_fn: Callable[[], bool], topics_provider_fn: TopicsProviderFn,
+    promote_topic_fn: PromoteTopicFn, sync_isr_fn: SyncIsrFn,
 ) -> None:
     global _BROKER_ID, _BROKER_API, _peer_map_fn, _self_api_base_fn
-    global _gossip_payload_fn, _handle_gossip_payload_fn
-    global _placement_getter, _refresh_owner_cache_fn, _is_leader_fn
-    global _topics_provider_fn, _promote_topic_fn, _sync_isr_fn, _configured
+    global _gossip_payload_fn, _handle_gossip_payload_fn, _placement_getter
+    global _refresh_owner_cache_fn, _is_leader_fn, _topics_provider_fn
+    global _promote_topic_fn, _sync_isr_fn, _configured
 
-    _BROKER_ID = broker_id
-    _BROKER_API = dict(broker_api)
-    _peer_map_fn = peer_map_fn
-    _self_api_base_fn = self_api_base_fn
-    _gossip_payload_fn = gossip_payload_fn
-    _handle_gossip_payload_fn = handle_gossip_payload_fn
-    _placement_getter = placement_getter
-    _refresh_owner_cache_fn = refresh_owner_cache_fn
-    _is_leader_fn = is_leader_fn
-    _topics_provider_fn = topics_provider_fn
-    _promote_topic_fn = promote_topic_fn
-    _sync_isr_fn = sync_isr_fn
+    _BROKER_ID, _BROKER_API = broker_id, dict(broker_api)
+    _peer_map_fn, _self_api_base_fn = peer_map_fn, self_api_base_fn
+    _gossip_payload_fn, _handle_gossip_payload_fn = gossip_payload_fn, handle_gossip_payload_fn
+    _placement_getter, _refresh_owner_cache_fn = placement_getter, refresh_owner_cache_fn
+    _is_leader_fn, _topics_provider_fn = is_leader_fn, topics_provider_fn
+    _promote_topic_fn, _sync_isr_fn = promote_topic_fn, sync_isr_fn
 
-    replication.setup(
-        broker_id=_BROKER_ID,
-        broker_api=_BROKER_API,
-        placement_getter=_placement_getter,
-        refresh_fn=_refresh_owner_cache_fn,
-    )
-
+    replication.setup(broker_id=_BROKER_ID, broker_api=_BROKER_API,
+                      placement_getter=_placement_getter, refresh_fn=_refresh_owner_cache_fn)
     _configured = True
 
 
@@ -92,27 +69,35 @@ def get_gossip_state() -> Optional[gossip.GossipState]:
     return _gossip_state
 
 
-def _require_configured() -> None:
-    if not _configured:
-        raise RuntimeError("configure_lifecycle() must be called before lifecycle_startup()")
+async def _start_task(name: str, coro_fn: Callable[[], Awaitable[None]]) -> None:
+    if name not in _tasks:
+        _tasks[name] = asyncio.create_task(coro_fn())
+
+
+async def _stop_task(name: str) -> None:
+    task = _tasks.pop(name, None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 async def lifecycle_startup() -> None:
-    _require_configured()
+    if not _configured:
+        raise RuntimeError("configure_lifecycle() must be called first")
     await _start_gossip()
-    await _start_replication()
-    await _start_metadata_sync()
-    await _start_failover_monitor()
-    await _start_isr_monitor()
-    await _start_leader_watch()
+    await _start_task("replication", replication.follower_replication_loop)
+    await _start_task("metadata_sync", _metadata_sync_loop)
+    await _start_task("failover", _failover_loop)
+    await _start_task("isr", _isr_loop)
+    await _start_task("leader_watch", _leader_watch_loop)
 
 
 async def lifecycle_shutdown() -> None:
-    await _stop_leader_watch()
-    await _stop_isr_monitor()
-    await _stop_failover_monitor()
-    await _stop_metadata_sync()
-    await _stop_replication()
+    for name in list(_tasks.keys()):
+        await _stop_task(name)
     await _stop_gossip()
 
 
@@ -120,80 +105,37 @@ async def _start_gossip() -> None:
     global _gossip_state, _gossip_service, _gossip_http
     if _gossip_state is not None:
         return
-    assert _self_api_base_fn is not None
-    assert _peer_map_fn is not None
-    assert _gossip_payload_fn is not None
-    assert _handle_gossip_payload_fn is not None
-
     state = gossip.GossipState(str(_BROKER_ID), _self_api_base_fn())
     http = aiohttp.ClientSession()
-    service = gossip.GossipService(
-        state,
-        http,
-        payload_fn=_gossip_payload_fn,
-        on_payload_fn=_handle_gossip_payload_fn,
-    )
+    service = gossip.GossipService(state, http, payload_fn=_gossip_payload_fn,
+                                    on_payload_fn=_handle_gossip_payload_fn)
     await service.start(_peer_map_fn())
-    _gossip_state = state
-    _gossip_service = service
-    _gossip_http = http
+    _gossip_state, _gossip_service, _gossip_http = state, service, http
 
 
 async def _stop_gossip() -> None:
     global _gossip_state, _gossip_service, _gossip_http
-    service = _gossip_service
-    if service is not None:
-        await service.stop()
-    if _gossip_http is not None:
+    if _gossip_service:
+        await _gossip_service.stop()
+    if _gossip_http:
         await _gossip_http.close()
-    _gossip_http = None
-    _gossip_service = None
-    _gossip_state = None
+    _gossip_http = _gossip_service = _gossip_state = None
 
 
-async def _start_replication() -> None:
-    global _replication_task
-    if _replication_task is not None:
-        return
-    _replication_task = asyncio.create_task(replication.follower_replication_loop())
-
-
-async def _stop_replication() -> None:
-    global _replication_task
-    task = _replication_task
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    _replication_task = None
-
-
-async def _start_metadata_sync() -> None:
-    global _metadata_sync_task
-    if _metadata_sync_task is not None:
-        return
-    _metadata_sync_task = asyncio.create_task(_metadata_sync_loop())
-
-
-async def _stop_metadata_sync() -> None:
-    global _metadata_sync_task
-    task = _metadata_sync_task
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    _metadata_sync_task = None
+async def _run_loop(fn: Callable[[], None], interval: float, name: str) -> None:
+    while True:
+        try:
+            if _is_leader_fn():
+                fn()
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[Broker {_BROKER_ID}] {name} error: {e}")
+            await asyncio.sleep(interval)
 
 
 async def _metadata_sync_loop() -> None:
-    assert _refresh_owner_cache_fn is not None
-    assert _is_leader_fn is not None
     while True:
         try:
             if not _is_leader_fn():
@@ -201,34 +143,12 @@ async def _metadata_sync_loop() -> None:
             await asyncio.sleep(2.0)
         except asyncio.CancelledError:
             break
-        except Exception as exc:
-            print(f"[Broker {_BROKER_ID}] metadata sync error: {exc}")
+        except Exception as e:
+            print(f"[Broker {_BROKER_ID}] metadata sync error: {e}")
             await asyncio.sleep(2.0)
 
 
-async def _start_leader_watch() -> None:
-    global _leader_watch_task
-    if _leader_watch_task is not None:
-        return
-    _leader_watch_task = asyncio.create_task(_leader_watch_loop())
-
-
-async def _stop_leader_watch() -> None:
-    global _leader_watch_task
-    task = _leader_watch_task
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    _leader_watch_task = None
-
-
 async def _leader_watch_loop() -> None:
-    assert _refresh_owner_cache_fn is not None
-    assert _is_leader_fn is not None
     was_leader = False
     while True:
         try:
@@ -239,35 +159,12 @@ async def _leader_watch_loop() -> None:
             await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             break
-        except Exception as exc:
-            print(f"[Broker {_BROKER_ID}] leader watch error: {exc}")
+        except Exception as e:
+            print(f"[Broker {_BROKER_ID}] leader watch error: {e}")
             await asyncio.sleep(1.0)
 
 
-async def _start_failover_monitor() -> None:
-    global _failover_task
-    if _failover_task is not None:
-        return
-    _failover_task = asyncio.create_task(_failover_loop())
-
-
-async def _stop_failover_monitor() -> None:
-    global _failover_task
-    task = _failover_task
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    _failover_task = None
-
-
 async def _failover_loop() -> None:
-    assert _is_leader_fn is not None
-    assert _topics_provider_fn is not None
-    assert _promote_topic_fn is not None
     while True:
         try:
             if _is_leader_fn():
@@ -276,35 +173,12 @@ async def _failover_loop() -> None:
             await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             break
-        except Exception as exc:
-            print(f"[Broker {_BROKER_ID}] failover monitor error: {exc}")
+        except Exception as e:
+            print(f"[Broker {_BROKER_ID}] failover error: {e}")
             await asyncio.sleep(1.0)
 
 
-async def _start_isr_monitor() -> None:
-    global _isr_task
-    if _isr_task is not None:
-        return
-    _isr_task = asyncio.create_task(_isr_loop())
-
-
-async def _stop_isr_monitor() -> None:
-    global _isr_task
-    task = _isr_task
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    _isr_task = None
-
-
 async def _isr_loop() -> None:
-    assert _is_leader_fn is not None
-    assert _topics_provider_fn is not None
-    assert _sync_isr_fn is not None
     while True:
         try:
             if _is_leader_fn():
@@ -313,6 +187,6 @@ async def _isr_loop() -> None:
             await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             break
-        except Exception as exc:
-            print(f"[Broker {_BROKER_ID}] ISR monitor error: {exc}")
+        except Exception as e:
+            print(f"[Broker {_BROKER_ID}] ISR error: {e}")
             await asyncio.sleep(1.0)

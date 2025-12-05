@@ -1,0 +1,242 @@
+.algorithms-panel {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.algo-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+
+.algo-tab {
+  flex: 1;
+  padding: 8px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.algo-tab:hover {
+  background: var(--bg-card-hover);
+}
+
+.algo-tab.active {
+  background: var(--accent-primary);
+  color: white;
+  border-color: var(--accent-primary);
+}
+
+.algo-content {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.algo-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.metrics-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.metrics-grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+
+.metric-card {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.metric-card.highlight {
+  border-color: var(--accent-primary);
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.metric-label {
+  font-size: 0.6rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.metric-value {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.metrics-table {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.metrics-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.metrics-row:last-child {
+  border-bottom: none;
+}
+
+.metrics-label {
+  color: var(--text-secondary);
+}
+
+.metrics-value {
+  font-weight: 500;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--text-primary);
+}
+
+.metrics-value.success {
+  color: var(--accent-success);
+}
+
+.metrics-value.error {
+  color: var(--accent-error);
+}
+
+.node-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+}
+
+.node-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+
+.node-status.alive {
+  border-left: 2px solid var(--accent-success);
+}
+
+.node-status.dead {
+  border-left: 2px solid var(--accent-error);
+  opacity: 0.5;
+}
+
+.node-status.leader {
+  border-left: 2px solid var(--accent-primary);
+  background: rgba(59, 130, 246, 0.05);
+}
+
+.node-label {
+  font-weight: 600;
+}
+
+.node-stat {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+
+.gossip-members-mini h4 {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.members-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.member-badge {
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.member-badge.alive {
+  background: rgba(34, 197, 94, 0.1);
+  color: var(--accent-success);
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.member-badge.suspect {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--accent-warning);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.member-badge.dead {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--accent-error);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.repl-success-rate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.rate-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.rate-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--border-color);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.rate-fill {
+  height: 100%;
+  background: var(--accent-success);
+  transition: width 0.3s;
+}
+
+.rate-value {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent-success);
+  min-width: 45px;
+  text-align: right;
+  font-family: 'JetBrains Mono', monospace;
+}
