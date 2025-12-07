@@ -5,6 +5,10 @@ import AlgorithmsPanel from './components/AlgorithmsPanel'
 import MetadataPanel from './components/MetadataPanel'
 import EventLog from './components/EventLog'
 import StressTest from './components/StressTest'
+import ReadScaleTest from './components/ReadScaleTest'
+import FailoverTest from './components/FailoverTest'
+import LeaderFailoverTest from './components/LeaderFailoverTest'
+import PerformanceSummary from './components/PerformanceSummary'
 import './App.css'
 
 const BROKER_PORTS = [8081, 8082, 8083, 8084]
@@ -172,6 +176,11 @@ function App() {
             leader={clusterData.leader}
             topics={clusterData.topics}
           />
+          <PerformanceSummary 
+            nodes={clusterData.nodes}
+            leader={clusterData.leader}
+            topics={clusterData.topics}
+          />
         </div>
         
         <div className="center-panel">
@@ -185,6 +194,19 @@ function App() {
         <div className="right-panel">
           <StressTest 
             topics={clusterData.topics}
+            nodes={clusterData.nodes}
+            leader={clusterData.leader}
+          />
+          <ReadScaleTest 
+            topics={clusterData.topics}
+            leader={clusterData.leader}
+          />
+          <FailoverTest 
+            topics={clusterData.topics}
+            nodes={clusterData.nodes}
+            leader={clusterData.leader}
+          />
+          <LeaderFailoverTest 
             nodes={clusterData.nodes}
             leader={clusterData.leader}
           />
